@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import tkinter as tk
+from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -830,21 +831,24 @@ class TangoController:
         self._require_connected()
         return self._get_motion_values(self.LSX_GetAccel, "Get acceleration")
 
-    def apply_motion_settings(self, speed_xy, accel_xy, secure_vel_xy):
+    def apply_motion_settings(self, speed_xy, accel_xy, secure_vel_xy, speed_z=None, accel_z=None, secure_vel_z=None):
         self._require_connected()
         cur_vel = self.get_velocity()
         cur_accel = self.get_acceleration()
         cur_sec_vel = self.get_secure_velocity()
+        speed_z = speed_xy if speed_z is None else speed_z
+        accel_z = accel_xy if accel_z is None else accel_z
+        secure_vel_z = secure_vel_xy if secure_vel_z is None else secure_vel_z
         self.check_status(
-            self.LSX_SetVel(ctypes.c_int(self.lsid), speed_xy, speed_xy, cur_vel[2], cur_vel[3]),
+            self.LSX_SetVel(ctypes.c_int(self.lsid), speed_xy, speed_xy, speed_z, cur_vel[3]),
             "Set velocity",
         )
         self.check_status(
-            self.LSX_SetAccel(ctypes.c_int(self.lsid), accel_xy, accel_xy, cur_accel[2], cur_accel[3]),
+            self.LSX_SetAccel(ctypes.c_int(self.lsid), accel_xy, accel_xy, accel_z, cur_accel[3]),
             "Set acceleration",
         )
         self.check_status(
-            self.LSX_SetSecVel(ctypes.c_int(self.lsid), secure_vel_xy, secure_vel_xy, cur_sec_vel[2], cur_sec_vel[3]),
+            self.LSX_SetSecVel(ctypes.c_int(self.lsid), secure_vel_xy, secure_vel_xy, secure_vel_z, cur_sec_vel[3]),
             "Set secure velocity",
         )
 
@@ -854,6 +858,14 @@ class TangoController:
         self.check_status(
             self.LSX_MoveAbs(ctypes.c_int(self.lsid), x, y, z, a, ctypes.c_int(0)),
             "Move absolute XY",
+        )
+
+    def move_absolute_a(self, a):
+        self._require_connected()
+        x, y, z, _ = self.get_position()
+        self.check_status(
+            self.LSX_MoveAbs(ctypes.c_int(self.lsid), x, y, z, a, ctypes.c_int(0)),
+            "Move absolute A",
         )
 
     def wait_for_xy_stop(self, timeout_ms):
@@ -968,6 +980,9 @@ class HeraTriggerApp(tk.Tk):
         self.last_live_render_time = 0.0
         self.live_render_interval_sec = 0.20
         self.live_max_preview_width = 480
+        self.live_auth_warning_logged = False
+        self.last_live_decode_error = ""
+        self.is_closing = False
         self.hyper_photo = None
         self.current_hypercube_handle = None
         self.current_hypercube_info = None
@@ -976,13 +991,12 @@ class HeraTriggerApp(tk.Tk):
         self.hyper_band_jump_var = tk.StringVar(value="1")
         self.current_hyper_wavelength_var = tk.StringVar(value="Wavelength: -")
         self.current_hyper_band_var = tk.StringVar(value="Band: -")
-
         self._configure_theme()
         self._build_ui()
         self.refresh_positions_tree()
         self.update_state("Idle")
         self.start_stage_polling()
-        self.after(250, self.auto_connect_devices)
+        self._safe_after(250, self.auto_connect_devices)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _configure_theme(self):
@@ -1538,6 +1552,8 @@ class HeraTriggerApp(tk.Tk):
             self.stage_status_var.set("Stage: not connected")
             self.stage_version_var.set("Controller: -")
             self.stage_position_var.set("X: -, Y: -")
+            self.current_x_label.config(text="X: -")
+            self.current_y_label.config(text="Y: -")
             self.log("Tango stage disconnected.")
         except Exception as exc:
             self.log(f"Failed to disconnect stage: {exc}")
@@ -1552,7 +1568,11 @@ class HeraTriggerApp(tk.Tk):
             if speed_xy <= 0:
                 raise RuntimeError("Stage speed must be greater than zero.")
             self.tango.apply_motion_settings(speed_xy=speed_xy, accel_xy=1.0, secure_vel_xy=50.0)
-            self.log(f"Stage motion updated: speedXY={speed_xy:.3f}")
+            velocities = self.tango.get_velocity()
+            self.log(
+                f"Stage motion updated: speedXY={speed_xy:.3f}, "
+                f"controllerVel=(X={velocities[0]:.3f}, Y={velocities[1]:.3f})"
+            )
         except Exception as exc:
             self.log(f"Failed to apply stage motion settings: {exc}")
             self.update_state("Error")
@@ -1571,10 +1591,21 @@ class HeraTriggerApp(tk.Tk):
     def start_stage_polling(self):
         self._poll_stage_position()
 
+    def _safe_after(self, delay_ms, callback):
+        if self.is_closing or not self.winfo_exists():
+            return None
+        try:
+            return self.after(delay_ms, callback)
+        except tk.TclError:
+            return None
+
     def _poll_stage_position(self):
+        if self.is_closing:
+            self.stage_poll_job = None
+            return
         self.update_stage_position_display()
         self._update_time_remaining()
-        self.stage_poll_job = self.after(250, self._poll_stage_position)
+        self.stage_poll_job = self._safe_after(250, self._poll_stage_position)
 
     def preflight_check(self):
         self.log("Running preflight checks...")
@@ -1675,7 +1706,7 @@ class HeraTriggerApp(tk.Tk):
                     self.after_cancel(self.live_watchdog_job)
                 except Exception:
                     pass
-            self.live_watchdog_job = self.after(8000, self._check_live_view_started)
+            self.live_watchdog_job = self._safe_after(8000, self._check_live_view_started)
             self.log(f"Hera live capture started using {self.live_pixel_format_name}.")
         except Exception as exc:
             self._set_live_view_status("Live view: failed to start")
@@ -1691,11 +1722,11 @@ class HeraTriggerApp(tk.Tk):
         def worker():
             try:
                 self.controller.stop_live_capture(silent=True)
-                self.after(0, self._clear_live_view_frame_state)
-                self.after(0, self.start_live_view)
+                self._safe_after(0, self._clear_live_view_frame_state)
+                self._safe_after(0, self.start_live_view)
             except Exception as exc:
                 self._log_async(f"Live view restart failed: {exc}")
-                self.after(0, lambda: self._set_live_view_status("Live view: restart failed"))
+                self._safe_after(0, lambda: self._set_live_view_status("Live view: restart failed"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1708,7 +1739,7 @@ class HeraTriggerApp(tk.Tk):
             pass
         self._clear_live_view_frame_state()
         self._set_live_view_status("Live view: stopped")
-        self.after(0, self._draw_live_view_placeholder)
+        self._safe_after(0, self._draw_live_view_placeholder)
 
     def _clear_live_view_frame_state(self):
         with self.live_frame_lock:
@@ -1718,6 +1749,8 @@ class HeraTriggerApp(tk.Tk):
             self.last_live_render_time = 0.0
         self.live_photo = None
         self.live_first_frame_rendered = False
+        self.live_auth_warning_logged = False
+        self.last_live_decode_error = ""
         if self.live_watchdog_job:
             try:
                 self.after_cancel(self.live_watchdog_job)
@@ -1726,12 +1759,18 @@ class HeraTriggerApp(tk.Tk):
             self.live_watchdog_job = None
 
     def _set_live_view_status(self, text):
+        if self.is_closing:
+            return
+        if self.live_view_status_var.get() == text:
+            return
         if threading.current_thread() is threading.main_thread():
             self.live_view_status_var.set(text)
         else:
-            self.after(0, lambda: self.live_view_status_var.set(text))
+            self._safe_after(0, lambda: self.live_view_status_var.set(text))
 
     def _schedule_live_render(self, force=False):
+        if self.is_closing:
+            return
         now = time.time()
         with self.live_frame_lock:
             if self.live_render_pending:
@@ -1739,7 +1778,7 @@ class HeraTriggerApp(tk.Tk):
             if not force and (now - self.last_live_render_time) < self.live_render_interval_sec:
                 return
             self.live_render_pending = True
-        self.after(0, self._render_live_photo)
+        self._safe_after(0, self._render_live_photo)
 
     def on_live_capture_error(self, message):
         self._log_async(f"Live capture error: {message}")
@@ -1750,7 +1789,11 @@ class HeraTriggerApp(tk.Tk):
 
     def on_live_capture_frame(self, capture_handle):
         try:
+            if self.is_closing:
+                return
             info = self.controller.get_live_capture_info(capture_handle)
+            self.live_auth_warning_logged = False
+            self.last_live_decode_error = ""
             if not info["data_ptr"]:
                 return
 
@@ -1762,41 +1805,17 @@ class HeraTriggerApp(tk.Tk):
             bytes_per_pixel = max(1, (bits_per_pixel + 7) // 8)
             raw_size = row_stride * height
             raw_buffer = ctypes.string_at(info["data_ptr"], raw_size)
-            if row_stride != width * bytes_per_pixel:
-                rows = [raw_buffer[row * row_stride: row * row_stride + (width * bytes_per_pixel)] for row in range(height)]
-                frame_bytes = b"".join(rows)
-            else:
-                frame_bytes = raw_buffer
-
-            if bytes_per_pixel == 1:
-                mono8_bytes = frame_bytes
-            else:
-                effective_depth = bit_depth if bit_depth > 0 else bits_per_pixel
-                max_value = float((1 << effective_depth) - 1) if effective_depth > 0 else 65535.0
-                converted = bytearray(width * height)
-                src_index = 0
-                dst_index = 0
-                for _ in range(width * height):
-                    sample = int.from_bytes(frame_bytes[src_index:src_index + bytes_per_pixel], "little", signed=False)
-                    converted[dst_index] = max(0, min(255, int(round((sample / max_value) * 255.0))))
-                    src_index += bytes_per_pixel
-                    dst_index += 1
-                mono8_bytes = bytes(converted)
-
-            target_w = min(width, self.live_max_preview_width)
-            scale = max(1, width // target_w)
-            if scale > 1:
-                sampled_rows = []
-                for row_index in range(0, height, scale):
-                    row = mono8_bytes[row_index * width:(row_index + 1) * width]
-                    sampled_rows.append(row[::scale])
-                display_bytes = b"".join(sampled_rows)
-                disp_width = len(sampled_rows[0]) if sampled_rows else width
-                disp_height = len(sampled_rows)
-            else:
-                display_bytes = mono8_bytes
-                disp_width = width
-                disp_height = height
+            scale = self._live_preview_scale(width)
+            display_bytes, disp_width, disp_height = self._extract_live_preview_bytes(
+                raw_buffer,
+                width,
+                height,
+                row_stride,
+                bytes_per_pixel,
+                bit_depth,
+                bits_per_pixel,
+                scale,
+            )
             display_bytes, preview_min, preview_max = self._normalize_grayscale_for_display(display_bytes)
 
             with self.live_frame_lock:
@@ -1817,7 +1836,15 @@ class HeraTriggerApp(tk.Tk):
                 self._log_async(f"Live preview auto-contrast range: min={preview_min}, max={preview_max}")
             self._schedule_live_render(force=not self.live_photo)
         except Exception as exc:
-            self._log_async(f"Live frame decode failed: {exc}")
+            error_text = str(exc)
+            if "Invalid authentication code" in error_text:
+                if not self.live_auth_warning_logged:
+                    self.live_auth_warning_logged = True
+                    self._set_live_view_status("Live view: SDK authentication warning")
+                    self._log_async(f"Live capture warning: {error_text}")
+            elif error_text != self.last_live_decode_error:
+                self.last_live_decode_error = error_text
+                self._log_async(f"Live frame decode failed: {error_text}")
         finally:
             try:
                 self.controller.release_live_capture_result(capture_handle)
@@ -1825,6 +1852,9 @@ class HeraTriggerApp(tk.Tk):
                 pass
 
     def _check_live_view_started(self):
+        if self.is_closing:
+            self.live_watchdog_job = None
+            return
         self.live_watchdog_job = None
         if not self.live_first_frame_logged:
             self._set_live_view_status("Live view: no frames received")
@@ -1989,6 +2019,13 @@ class HeraTriggerApp(tk.Tk):
             self.log(f"Failed to abort acquisition: {exc}")
             self.update_state("Error")
 
+    def _await_acquisition_completion(self, timeout_sec=300):
+        if not self.acquisition_done_event.wait(timeout=timeout_sec):
+            raise RuntimeError("Timed out waiting for Hera acquisition to complete.")
+        if not self.acquisition_success:
+            raise RuntimeError(self.last_acquisition_error or "Hera acquisition failed.")
+        return self.last_export_path
+
     def run_stage_site_acquisition(self, position, cycle_index=None):
         with self.stage_lock:
             if not self.tango or not self.tango.connected:
@@ -2004,19 +2041,13 @@ class HeraTriggerApp(tk.Tk):
             if dwell > 0:
                 self.log(f"Settling at {position.name} for {dwell:.1f} seconds.")
                 time.sleep(dwell)
-
-            self.log(f"Starting Hera acquisition at {position.name}.")
-            if cycle_index is None:
-                export_tag = self._sanitize_export_tag(f"{position.name}_{time.strftime('%Y%m%d_%H%M%S')}")
-            else:
-                export_tag = self._sanitize_export_tag(f"cycle_{cycle_index:03d}_{position.name}")
-            self._arm_and_start_acquisition(export_tag=export_tag)
-
-        if not self.acquisition_done_event.wait(timeout=300):
-            raise RuntimeError("Timed out waiting for Hera acquisition to complete.")
-        if not self.acquisition_success:
-            raise RuntimeError(self.last_acquisition_error or "Hera acquisition failed.")
-        return self.last_export_path
+        self.log(f"Starting Hera acquisition at {position.name}.")
+        if cycle_index is None:
+            export_tag = self._sanitize_export_tag(f"{position.name}_{time.strftime('%Y%m%d_%H%M%S')}")
+        else:
+            export_tag = self._sanitize_export_tag(f"cycle_{cycle_index:03d}_{position.name}")
+        self._arm_and_start_acquisition(export_tag=export_tag)
+        return self._await_acquisition_completion()
 
     def add_current_position(self):
         try:
@@ -2193,7 +2224,7 @@ class HeraTriggerApp(tk.Tk):
                 self._log_async(f"Manual site run completed for {position.name}: {export_path}")
             except Exception as exc:
                 self._log_async(f"Manual site run failed: {exc}")
-                self.after(0, lambda: self.update_state("Error"))
+                self._safe_after(0, lambda: self.update_state("Error"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2301,10 +2332,10 @@ class HeraTriggerApp(tk.Tk):
                     time.sleep(0.25)
         except Exception as exc:
             self._log_async(f"Timelapse failed: {exc}")
-            self.after(0, lambda: self.update_state("Error"))
+            self._safe_after(0, lambda: self.update_state("Error"))
         finally:
             self._write_trigger_log_if_needed()
-            self.after(0, self._finish_timelapse)
+            self._safe_after(0, self._finish_timelapse)
 
     def _finish_timelapse(self):
         self.timelapse_stop_event.set()
@@ -2344,14 +2375,16 @@ class HeraTriggerApp(tk.Tk):
 
     def on_progress_update(self, progress):
         def update():
+            if self.is_closing:
+                return
             if self.app_state == self.STATE_LABELS["WaitingForTrigger"] and progress > 0:
                 self.update_state("Acquiring")
             self.log(f"Acquisition progress: {progress * 100:.1f}%")
 
-        self.after(0, update)
+        self._safe_after(0, update)
 
     def on_hyperspectral_data_acquired(self, data_handle, data_status, message):
-        self.after(0, lambda: self._start_data_processing(data_handle, data_status, message))
+        self._safe_after(0, lambda: self._start_data_processing(data_handle, data_status, message))
 
     def _start_data_processing(self, data_handle, data_status, message):
         self.log(f'Acquisition callback received: status={data_status}, message="{message}"')
@@ -2404,7 +2437,7 @@ class HeraTriggerApp(tk.Tk):
             }
             self.current_hyper_band_cache = {}
             viewer_bound = True
-            self.after(
+            self._safe_after(
                 0,
                 lambda: (
                     self.hyper_band_scale.config(to=max(cube_bands - 1, 0)),
@@ -2419,7 +2452,7 @@ class HeraTriggerApp(tk.Tk):
                 except Exception:
                     pass
 
-            self.after(0, lambda: self.update_state("Saving"))
+            self._safe_after(0, lambda: self.update_state("Saving"))
             output_dir = self.param_vars["output_path"].get()
             os.makedirs(output_dir, exist_ok=True)
             export_tag = self.pending_export_tag or self._sanitize_export_tag(time.strftime("hera_hypercube_%Y%m%d_%H%M%S"))
@@ -2432,7 +2465,7 @@ class HeraTriggerApp(tk.Tk):
             self._log_async(f"Exported hypercube and confirmed files: {hdr_path}")
             self.acquisition_success = True
             self.last_acquisition_error = ""
-            self.after(0, lambda: self.update_state("Completed"))
+            self._safe_after(0, lambda: self.update_state("Completed"))
         except Exception as exc:
             self.last_acquisition_error = str(exc)
             self.acquisition_success = False
@@ -2441,7 +2474,7 @@ class HeraTriggerApp(tk.Tk):
                 self.current_hypercube_handle = None
                 self.current_hypercube_info = None
                 self.current_hyper_band_cache = {}
-                self.after(
+                self._safe_after(
                     0,
                     lambda: (
                         self.hyper_band_scale.config(to=0),
@@ -2456,7 +2489,7 @@ class HeraTriggerApp(tk.Tk):
                     self.controller.release_hypercube(hypercube_handle)
                 except Exception:
                     pass
-            self.after(0, lambda: self.update_state("Error"))
+            self._safe_after(0, lambda: self.update_state("Error"))
         finally:
             if data_handle:
                 self.controller.release_hyperspectral_data(data_handle)
@@ -2464,14 +2497,16 @@ class HeraTriggerApp(tk.Tk):
             self.processing_lock.release()
 
     def _log_async(self, message):
-        self.after(0, lambda: self.log(message))
+        self._safe_after(0, lambda: self.log(message))
 
     def _set_var_async(self, var, value):
         def setter():
+            if self.is_closing:
+                return
             var.set(value)
             self._draw_live_view_placeholder()
             self.render_current_hyper_band()
-        self.after(0, setter)
+        self._safe_after(0, setter)
 
     def _fit_dimensions(self, src_width, src_height, dest_width, dest_height):
         if src_width <= 0 or src_height <= 0:
@@ -2482,6 +2517,57 @@ class HeraTriggerApp(tk.Tk):
         out_w = max(1, int(src_width * scale))
         out_h = max(1, int(src_height * scale))
         return out_w, out_h
+
+    def _live_preview_scale(self, width):
+        target_w = min(width, self.live_max_preview_width)
+        return max(1, math.ceil(width / target_w))
+
+    def _extract_live_preview_bytes(self, raw_buffer, width, height, row_stride, bytes_per_pixel, bit_depth, bits_per_pixel, scale):
+        display_width = max(1, math.ceil(width / scale))
+        display_height = max(1, math.ceil(height / scale))
+        pixel_row_bytes = width * bytes_per_pixel
+        raw_view = memoryview(raw_buffer)
+
+        if bytes_per_pixel == 1:
+            sampled_rows = []
+            for row_index in range(0, height, scale):
+                row_start = row_index * row_stride
+                row_end = row_start + pixel_row_bytes
+                sampled_rows.append(bytes(raw_view[row_start:row_end:scale]))
+            return b"".join(sampled_rows), display_width, len(sampled_rows)
+
+        if bytes_per_pixel == 2:
+            effective_depth = bit_depth if bit_depth > 0 else bits_per_pixel
+            shift = max(effective_depth - 8, 0)
+            sampled = bytearray(display_width * display_height)
+            dst_index = 0
+            for row_index in range(0, height, scale):
+                row_start = row_index * row_stride
+                row_end = row_start + pixel_row_bytes
+                row_samples = raw_view[row_start:row_end].cast("H")
+                for sample in row_samples[::scale]:
+                    if shift:
+                        sample = sample >> shift
+                    if sample > 255:
+                        sample = 255
+                    sampled[dst_index] = sample
+                    dst_index += 1
+            return bytes(sampled[:dst_index]), display_width, max(1, dst_index // display_width)
+
+        effective_depth = bit_depth if bit_depth > 0 else bits_per_pixel
+        max_value = float((1 << effective_depth) - 1) if effective_depth > 0 else 65535.0
+        sampled = bytearray(display_width * display_height)
+        dst_index = 0
+        for row_index in range(0, height, scale):
+            row_start = row_index * row_stride
+            row_end = row_start + pixel_row_bytes
+            row_bytes = raw_view[row_start:row_end]
+            for column_index in range(0, width, scale):
+                src_index = column_index * bytes_per_pixel
+                sample = int.from_bytes(row_bytes[src_index:src_index + bytes_per_pixel], "little", signed=False)
+                sampled[dst_index] = max(0, min(255, int(round((sample / max_value) * 255.0))))
+                dst_index += 1
+        return bytes(sampled[:dst_index]), display_width, max(1, dst_index // display_width)
 
     def _resample_grayscale_nearest(self, src_bytes, src_width, src_height, dst_width, dst_height):
         if (src_width, src_height) == (dst_width, dst_height):
@@ -2513,13 +2599,18 @@ class HeraTriggerApp(tk.Tk):
     def _make_ppm_photo_from_grayscale(self, gray_bytes, src_width, src_height, dest_width, dest_height):
         out_w, out_h = self._fit_dimensions(src_width, src_height, dest_width, dest_height)
         scaled = self._resample_grayscale_nearest(gray_bytes, src_width, src_height, out_w, out_h)
-        photo = tk.PhotoImage(width=out_w, height=out_h)
-        rows = []
-        for row_index in range(out_h):
-            start = row_index * out_w
-            row = scaled[start:start + out_w]
-            rows.append("{" + " ".join(f"#{value:02x}{value:02x}{value:02x}" for value in row) + "}")
-        photo.put(" ".join(rows))
+        ppm_payload = bytearray(len(scaled) * 3)
+        dst_index = 0
+        for value in scaled:
+            ppm_payload[dst_index] = value
+            ppm_payload[dst_index + 1] = value
+            ppm_payload[dst_index + 2] = value
+            dst_index += 3
+        ppm_bytes = f"P6\n{out_w} {out_h}\n255\n".encode("ascii") + bytes(ppm_payload)
+        try:
+            photo = tk.PhotoImage(data=ppm_bytes, format="PPM")
+        except tk.TclError:
+            photo = tk.PhotoImage(data=b64encode(ppm_bytes), format="PPM")
         return photo, out_w, out_h
 
     def _clear_hypercube_viewer(self):
@@ -2538,7 +2629,7 @@ class HeraTriggerApp(tk.Tk):
         self.hyper_photo = None
         if hasattr(self, "hyper_band_scale"):
             self.hyper_band_scale.config(to=0)
-        self.after(0, self.render_current_hyper_band)
+        self._safe_after(0, self.render_current_hyper_band)
 
     def on_hyper_band_changed(self, _value=None):
         self.render_current_hyper_band()
@@ -2747,12 +2838,24 @@ class HeraTriggerApp(tk.Tk):
         self.log_text.config(state="disabled")
 
     def on_close(self):
+        if self.is_closing:
+            return
+        self.is_closing = True
         self.timelapse_stop_event.set()
+        self.timelapse_pause_event.clear()
+        self.acquisition_done_event.set()
         try:
             if self.stage_poll_job:
                 self.after_cancel(self.stage_poll_job)
         except Exception:
             pass
+        self.stage_poll_job = None
+        try:
+            if self.live_watchdog_job:
+                self.after_cancel(self.live_watchdog_job)
+        except Exception:
+            pass
+        self.live_watchdog_job = None
         try:
             if self.tango and self.tango.connected:
                 try:
@@ -2765,6 +2868,7 @@ class HeraTriggerApp(tk.Tk):
         try:
             if self.controller:
                 self._clear_hypercube_viewer()
+                self.stop_live_view()
                 if self.controller.connected:
                     try:
                         if self.controller.is_acquiring():
