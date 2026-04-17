@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+
+# Large local reference material
+*.zip
+MatLab/
+DLL_Files_V1520_240813/
+
+xiapi64.dll
