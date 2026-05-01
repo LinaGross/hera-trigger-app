@@ -2063,7 +2063,7 @@ class HeraTriggerApp(tk.Tk):
             info = self.controller.get_live_capture_info(capture_handle)
             self.live_auth_warning_logged = False
             self.last_live_decode_error = ""
-            if not info["data_ptr"]:
+            if not info["data_ptr"] or self.is_closing:
                 return
 
             width = info["width"]
@@ -3154,37 +3154,41 @@ class HeraTriggerApp(tk.Tk):
         self.timelapse_stop_event.set()
         self.timelapse_pause_event.clear()
         self.acquisition_done_event.set()
-        try:
-            if self.stage_poll_job:
-                self.after_cancel(self.stage_poll_job)
-        except Exception:
-            pass
-        self.stage_poll_job = None
-        try:
-            if self.nis_z_poll_job:
-                self.after_cancel(self.nis_z_poll_job)
-        except Exception:
-            pass
-        self.nis_z_poll_job = None
-        try:
-            if self.live_watchdog_job:
-                self.after_cancel(self.live_watchdog_job)
-        except Exception:
-            pass
-        self.live_watchdog_job = None
+        for job_attr in ("stage_poll_job", "nis_z_poll_job", "live_watchdog_job"):
+            job = getattr(self, job_attr, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+            setattr(self, job_attr, None)
+        # Destroy the window immediately so it disappears at once.
+        # SDK cleanup runs in a non-daemon thread so resources are released
+        # cleanly before the process exits.
+        self.destroy()
+        threading.Thread(target=self._cleanup_hardware, daemon=False).start()
+
+    def _cleanup_hardware(self):
         try:
             if self.tango and self.tango.connected:
                 try:
                     self.tango.stop_axes()
                 except Exception:
                     pass
-                self.tango.disconnect()
+                try:
+                    self.tango.disconnect()
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
             if self.controller:
-                self._clear_hypercube_viewer()
-                self.stop_live_view()
+                if self.current_hypercube_handle:
+                    try:
+                        self.controller.release_hypercube(self.current_hypercube_handle)
+                    except Exception:
+                        pass
+                    self.current_hypercube_handle = None
                 if self.controller.connected:
                     try:
                         if self.controller.is_acquiring():
@@ -3195,9 +3199,12 @@ class HeraTriggerApp(tk.Tk):
                         self.controller.disconnect()
                     except Exception:
                         pass
-                self.controller.release_device()
-        finally:
-            self.destroy()
+                try:
+                    self.controller.release_device()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
