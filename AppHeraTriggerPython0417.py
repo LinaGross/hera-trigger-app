@@ -924,8 +924,13 @@ class NISZBridgeController:
 
     def _send_and_wait(self, command_text, timeout_sec=90):
         command_text = command_text.strip()
-        if command_text not in self.SUPPORTED_COMMANDS:
-            raise RuntimeError(f"Unsupported stable NIS Z command: {command_text!r}")
+        valid = (
+            command_text in {"GET_Z", "STOP"}
+            or command_text.startswith("MOVE_REL ")
+            or command_text.startswith("MOVE_ABS ")
+        )
+        if not valid:
+            raise RuntimeError(f"Unsupported NIS Z command: {command_text!r}")
 
         self.commands_dir.mkdir(parents=True, exist_ok=True)
         self.responses_dir.mkdir(parents=True, exist_ok=True)
@@ -964,13 +969,7 @@ class NISZBridgeController:
         return self._parse_z(self._send_and_wait("GET_Z", timeout_sec))
 
     def move_rel(self, dz, timeout_sec=90):
-        if abs(dz - 1.0) < 0.000001:
-            command = "MOVE_REL 1.000000"
-        elif abs(dz + 1.0) < 0.000001:
-            command = "MOVE_REL -1.000000"
-        else:
-            raise RuntimeError("Stable shared-folder bridge only supports Step 1.000000 for Move + and Move -.")
-        return self._parse_z(self._send_and_wait(command, timeout_sec))
+        return self._parse_z(self._send_and_wait(f"MOVE_REL {dz:.6f}", timeout_sec))
 
     def move_abs(self, z, z_min, z_max, timeout_sec=90):
         return self._parse_z(self._send_and_wait(f"MOVE_ABS {z:.6f} {z_min:.6f} {z_max:.6f}", timeout_sec))
