@@ -1,0 +1,118 @@
+int main()
+{
+    double z;
+    int rc;
+    char response[256];
+
+    WriteFile("E:/Jiayi/NISZBridge/responses/watcher_started.txt", "started", 20);
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_getz.txt") == 1)
+    {
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_getz_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_getz.txt", "E:/Jiayi/NISZBridge/commands/current_getz.txt");
+            return rc;
+        }
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_getz_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_getz.txt", "E:/Jiayi/NISZBridge/commands/current_getz.txt");
+        return 1;
+    }
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_move_rel_p1.txt") == 1)
+    {
+        rc = StgMoveZ(1.0, 1);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ relative +1 failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_p1_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_p1.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_p1.txt");
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ after +1 failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_p1_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_p1.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_p1.txt");
+            return rc;
+        }
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_p1_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_move_rel_p1.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_p1.txt");
+        return 1;
+    }
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_move_rel_m1.txt") == 1)
+    {
+        rc = StgMoveZ(-1.0, 1);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ relative -1 failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_m1_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_m1.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_m1.txt");
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ after -1 failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_m1_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_m1.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_m1.txt");
+            return rc;
+        }
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_m1_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_move_rel_m1.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_m1.txt");
+        return 1;
+    }
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_move_abs_4100_4050_7000.txt") == 1)
+    {
+        rc = StgMoveZ(4100.0, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ absolute 4100 failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_abs_4100_4050_7000_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_abs_4100_4050_7000.txt", "E:/Jiayi/NISZBridge/commands/current_move_abs_4100_4050_7000.txt");
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_move_abs_4100_4050_7000_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_move_abs_4100_4050_7000.txt", "E:/Jiayi/NISZBridge/commands/current_move_abs_4100_4050_7000.txt");
+        return 1;
+    }
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_move_abs_4200_4000_8100.txt") == 1)
+    {
+        rc = StgMoveZ(4200.0, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ absolute 4200 failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_abs_4200_4000_8100_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_abs_4200_4000_8100.txt", "E:/Jiayi/NISZBridge/commands/current_move_abs_4200_4000_8100.txt");
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_move_abs_4200_4000_8100_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_move_abs_4200_4000_8100.txt", "E:/Jiayi/NISZBridge/commands/current_move_abs_4200_4000_8100.txt");
+        return 1;
+    }
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_stop.txt") == 1)
+    {
+        rc = StgGetPosZ(&z, 0);
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_stop_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_stop.txt", "E:/Jiayi/NISZBridge/commands/current_stop.txt");
+        return 1;
+    }
+
+    WriteFile("E:/Jiayi/NISZBridge/responses/no_known_command.txt", "no known command", 40);
+    return 0;
+}

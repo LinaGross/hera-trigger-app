@@ -1,0 +1,185 @@
+// Pure NIS macro, continuous Z text bridge watcher.
+// Copy this file to a local folder on the NIS PC and run it from there.
+// Stop it with the NIS macro stop/abort control.
+// It watches shared commands/*.txt, writes responses/*.txt, and moves processed commands.
+
+#define COMMANDS_DIR "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/commands"
+#define RESPONSES_DIR "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/responses"
+#define PROCESSED_DIR "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/processed"
+#define ERRORS_DIR "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/errors"
+#define COMMAND_GLOB "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/commands/*.txt"
+#define MAX_RELATIVE_STEP_UM 5.0
+
+void WriteText(char *path, char *text)
+{
+    WriteFile(path, text, strlen(text) * 2);
+}
+
+void BuildOutputPath(char *out, char *folder, char *commandPath)
+{
+    char *base;
+
+    base = strrchr(commandPath, '/');
+    if(base == NULL) base = strrchr(commandPath, '\\');
+    if(base == NULL) base = commandPath;
+    else base = base + 1;
+
+    sprintf(out, "%s/%s", folder, base);
+}
+
+void WriteError(char *responsePath, char *message)
+{
+    char response[512];
+    sprintf(response, "ERROR %s", message);
+    WriteText(responsePath, response);
+}
+
+int ProcessCommand(char *commandPath)
+{
+    char command[512];
+    char action[64];
+    char responsePath[512];
+    char processedPath[512];
+    char errorPath[512];
+    char response[512];
+    double v1, v2, v3;
+    double z;
+    int fields;
+    int rc;
+
+    BuildOutputPath(responsePath, RESPONSES_DIR, commandPath);
+    BuildOutputPath(processedPath, PROCESSED_DIR, commandPath);
+    BuildOutputPath(errorPath, ERRORS_DIR, commandPath);
+
+    *command = 0;
+    *action = 0;
+    v1 = 0.0;
+    v2 = 0.0;
+    v3 = 0.0;
+
+    if(ReadFile(commandPath, command, 511) != TRUE)
+    {
+        WriteError(responsePath, "ReadFile failed.");
+        RenameFile(errorPath, commandPath);
+        return -1;
+    }
+
+    fields = sscanf(command, "%s %lf %lf %lf", action, &v1, &v2, &v3);
+
+    if(strcmp(action, "GET_Z") == 0)
+    {
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ failed %d", rc);
+            WriteText(responsePath, response);
+            RenameFile(errorPath, commandPath);
+            return rc;
+        }
+        sprintf(response, "OK %.6f", z);
+        WriteText(responsePath, response);
+        RenameFile(processedPath, commandPath);
+        return 1;
+    }
+
+    if(strcmp(action, "MOVE_REL") == 0)
+    {
+        if(fields < 2)
+        {
+            WriteError(responsePath, "MOVE_REL missing dz_um.");
+            RenameFile(errorPath, commandPath);
+            return -1;
+        }
+        if(v1 > MAX_RELATIVE_STEP_UM || v1 < -MAX_RELATIVE_STEP_UM)
+        {
+            WriteError(responsePath, "MOVE_REL exceeds max step.");
+            RenameFile(errorPath, commandPath);
+            return -1;
+        }
+        rc = StgMoveZ(v1, 1);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ relative failed %d", rc);
+            WriteText(responsePath, response);
+            RenameFile(errorPath, commandPath);
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1) z = 0.0;
+        sprintf(response, "OK %.6f", z);
+        WriteText(responsePath, response);
+        RenameFile(processedPath, commandPath);
+        return 1;
+    }
+
+    if(strcmp(action, "MOVE_ABS") == 0)
+    {
+        if(fields < 4)
+        {
+            WriteError(responsePath, "MOVE_ABS missing z/min/max.");
+            RenameFile(errorPath, commandPath);
+            return -1;
+        }
+        if(v2 >= v3 || v1 < v2 || v1 > v3)
+        {
+            WriteError(responsePath, "MOVE_ABS target outside safe range.");
+            RenameFile(errorPath, commandPath);
+            return -1;
+        }
+        rc = StgMoveZ(v1, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ absolute failed %d", rc);
+            WriteText(responsePath, response);
+            RenameFile(errorPath, commandPath);
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1) z = 0.0;
+        sprintf(response, "OK %.6f", z);
+        WriteText(responsePath, response);
+        RenameFile(processedPath, commandPath);
+        return 1;
+    }
+
+    if(strcmp(action, "STOP") == 0)
+    {
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1) z = 0.0;
+        sprintf(response, "OK %.6f", z);
+        WriteText(responsePath, response);
+        RenameFile(processedPath, commandPath);
+        return 1;
+    }
+
+    WriteError(responsePath, "Unsupported command.");
+    RenameFile(errorPath, commandPath);
+    return -1;
+}
+
+int ProcessNextCommand()
+{
+    char filenames[28800];
+    char *commandPath;
+    int numfiles;
+
+    numfiles = FindFiles(filenames, 28800, COMMAND_GLOB, 0);
+    if(numfiles <= 0) return 0;
+
+    commandPath = filenames;
+    return ProcessCommand(commandPath);
+}
+
+int main()
+{
+    MakeDirectory(PROCESSED_DIR);
+    MakeDirectory(ERRORS_DIR);
+
+    while(1)
+    {
+        ProcessNextCommand();
+        Wait(1);
+    }
+
+    return 1;
+}

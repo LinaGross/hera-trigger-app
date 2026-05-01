@@ -2,12 +2,15 @@ import ctypes
 import csv
 import math
 import os
+import socket
 import threading
 import time
+import uuid
 import tkinter as tk
 from base64 import b64encode
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
@@ -16,6 +19,7 @@ class SavedPosition:
     name: str
     x: float
     y: float
+    z: float = math.nan
 
 
 class HeraDeviceInfo(ctypes.Structure):
@@ -900,6 +904,80 @@ class TangoController:
             raise RuntimeError("Tango stage is not connected.")
 
 
+class NISZBridgeController:
+    """Shared-folder client for the stable NIS-Z-Bridge sync workflow."""
+
+    DEFAULT_SHARED_ROOT = r"\\sti-nas1.rcp.epfl.ch\bios\bios-raw\backups\visible\cell\Jiayi_bios-raw\Z control shared"
+    SUPPORTED_COMMANDS = {
+        "GET_Z",
+        "MOVE_REL 1.000000",
+        "MOVE_REL -1.000000",
+        "MOVE_ABS 4100.000000 4050.000000 7000.000000",
+        "MOVE_ABS 4200.000000 4000.000000 8100.000000",
+        "STOP",
+    }
+
+    def __init__(self, shared_root=None):
+        self.shared_root = Path(shared_root or self.DEFAULT_SHARED_ROOT)
+        self.commands_dir = self.shared_root / "commands"
+        self.responses_dir = self.shared_root / "responses"
+
+    def _send_and_wait(self, command_text, timeout_sec=90):
+        command_text = command_text.strip()
+        if command_text not in self.SUPPORTED_COMMANDS:
+            raise RuntimeError(f"Unsupported stable NIS Z command: {command_text!r}")
+
+        self.commands_dir.mkdir(parents=True, exist_ok=True)
+        self.responses_dir.mkdir(parents=True, exist_ok=True)
+
+        command_id = f"hera_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        command_path = self.commands_dir / f"{command_id}.txt"
+        response_path = self.responses_dir / f"{command_id}.txt"
+        tmp_path = command_path.with_suffix(command_path.suffix + ".tmp")
+
+        tmp_path.write_text(command_text + "\n", encoding="ascii", newline="\n")
+        tmp_path.replace(command_path)
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if response_path.exists():
+                raw = response_path.read_bytes()
+                if len(raw) > 1 and raw[1] == 0:
+                    response = raw.decode("utf-16-le", errors="replace").replace("\x00", "").strip()
+                else:
+                    response = raw.decode("ascii", errors="ignore").strip()
+                return response
+            time.sleep(0.25)
+
+        raise RuntimeError(
+            f"Timed out waiting for shared response {response_path}. "
+            "On the NIS PC, make sure nis_z_sync_shared_to_local.py is running and run the NIS macro."
+        )
+
+    def _parse_z(self, response):
+        if response.startswith("OK"):
+            parts = response.split(None, 1)
+            return float(parts[1]) if len(parts) == 2 else 0.0
+        raise RuntimeError(f"NIS Z bridge error: {response}")
+
+    def get_z(self, timeout_sec=90):
+        return self._parse_z(self._send_and_wait("GET_Z", timeout_sec))
+
+    def move_rel(self, dz, timeout_sec=90):
+        if abs(dz - 1.0) < 0.000001:
+            command = "MOVE_REL 1.000000"
+        elif abs(dz + 1.0) < 0.000001:
+            command = "MOVE_REL -1.000000"
+        else:
+            raise RuntimeError("Stable shared-folder bridge only supports Step 1.000000 for Move + and Move -.")
+        return self._parse_z(self._send_and_wait(command, timeout_sec))
+
+    def move_abs(self, z, z_min, z_max, timeout_sec=90):
+        return self._parse_z(self._send_and_wait(f"MOVE_ABS {z:.6f} {z_min:.6f} {z_max:.6f}", timeout_sec))
+
+    def stop(self, timeout_sec=30):
+        return self._parse_z(self._send_and_wait("STOP", timeout_sec))
+
 class HeraTriggerApp(tk.Tk):
     STATE_LABELS = {
         "Idle": "Idle",
@@ -937,7 +1015,7 @@ class HeraTriggerApp(tk.Tk):
         self.controller = None
         self.tango = None
         self.devices = []
-        self.positions = [SavedPosition("Start", 0.0, 0.0)]
+        self.positions = [SavedPosition("Start", 0.0, 0.0, math.nan)]
         self.selected_position_index = None
         self.processing_lock = threading.Lock()
         self.stage_lock = threading.Lock()
@@ -991,6 +1069,18 @@ class HeraTriggerApp(tk.Tk):
         self.hyper_band_jump_var = tk.StringVar(value="1")
         self.current_hyper_wavelength_var = tk.StringVar(value="Wavelength: -")
         self.current_hyper_band_var = tk.StringVar(value="Band: -")
+        self.nis_z = None
+        self.nis_z_shared_root_var = tk.StringVar(value=NISZBridgeController.DEFAULT_SHARED_ROOT)
+        self.nis_z_current_z_var = tk.StringVar(value="Z: -")
+        self.nis_z_status_var = tk.StringVar(value="NIS Z: idle")
+        self.nis_z_timeout_var = tk.IntVar(value=90)
+        self.nis_z_step_var = tk.StringVar(value="1.0")
+        self.nis_z_last_value = None
+        self.nis_z_last_status = "not checked"
+        self.nis_z_poll_job = None
+        self.nis_z_poll_inflight = False
+        self.nis_z_request_lock = threading.Lock()
+        self.nis_z_poll_interval_ms = 5000
         self._configure_theme()
         self._build_ui()
         self.refresh_positions_tree()
@@ -1096,14 +1186,31 @@ class HeraTriggerApp(tk.Tk):
         body.grid_columnconfigure(2, weight=0)
         body.grid_rowconfigure(0, weight=1)
 
-        left = tk.Frame(body, bg="#14181d")
-        left.grid(row=0, column=0, sticky="nsw")
+        left_outer = tk.Frame(body, bg="#14181d")
+        left_outer.grid(row=0, column=0, sticky="nsw")
+        left_scroll = ttk.Scrollbar(left_outer, orient="vertical")
+        left_scroll.pack(side="right", fill="y")
+        left_canvas = tk.Canvas(
+            left_outer, bg="#14181d", highlightthickness=0,
+            width=355, yscrollcommand=left_scroll.set,
+        )
+        left_canvas.pack(side="left", fill="both", expand=True)
+        left_scroll.config(command=left_canvas.yview)
+        left = tk.Frame(left_canvas, bg="#14181d")
+        left_win = left_canvas.create_window((0, 0), window=left, anchor="nw")
+        left.bind("<Configure>", lambda _e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+        left_canvas.bind("<Configure>", lambda e: left_canvas.itemconfig(left_win, width=e.width))
+        left_canvas.bind("<Enter>", lambda _e: left_canvas.bind_all(
+            "<MouseWheel>", lambda e: left_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")))
+        left_canvas.bind("<Leave>", lambda _e: left_canvas.unbind_all("<MouseWheel>"))
+
         center = tk.Frame(body, bg="#14181d")
         center.grid(row=0, column=1, sticky="nsew", padx=12)
         right = tk.Frame(body, bg="#14181d")
         right.grid(row=0, column=2, sticky="nse")
 
         self._build_tango_ui(left)
+        self._build_nis_z_ui(left)
         self._build_log_ui(center)
         self._build_hera_ui(right)
 
@@ -1186,6 +1293,7 @@ class HeraTriggerApp(tk.Tk):
         self.selected_name_var = tk.StringVar()
         self.selected_x_var = tk.StringVar()
         self.selected_y_var = tk.StringVar()
+        self.selected_z_var = tk.StringVar()
 
         tk.Label(frame, text="Position name").grid(row=0, column=0, sticky="w", pady=(0, 2))
         tk.Entry(frame, textvariable=self.position_name_var, width=24).grid(row=1, column=0, sticky="ew")
@@ -1208,12 +1316,14 @@ class HeraTriggerApp(tk.Tk):
         tk.Label(frame, textvariable=self.stage_status_var, font=("Segoe UI", 10, "bold")).grid(row=4, column=0, sticky="w", pady=(12, 0))
         tk.Label(frame, textvariable=self.stage_version_var).grid(row=5, column=0, sticky="w", pady=(4, 0))
 
-        pos_panel = tk.LabelFrame(frame, text="Current XY Position", padx=8, pady=8)
+        pos_panel = tk.LabelFrame(frame, text="Current XYZ Position", padx=8, pady=8)
         pos_panel.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         self.current_x_label = tk.Label(pos_panel, text="X: -")
         self.current_x_label.pack(anchor="w")
         self.current_y_label = tk.Label(pos_panel, text="Y: -")
         self.current_y_label.pack(anchor="w", pady=(4, 0))
+        self.current_z_label = tk.Label(pos_panel, textvariable=self.nis_z_current_z_var)
+        self.current_z_label.pack(anchor="w", pady=(4, 0))
 
         goto_panel = tk.LabelFrame(frame, text="Go To Saved Position", padx=8, pady=8)
         goto_panel.grid(row=7, column=0, sticky="ew", pady=(10, 0))
@@ -1226,10 +1336,12 @@ class HeraTriggerApp(tk.Tk):
         tk.Label(coord_row, text="X").pack(side="left")
         tk.Entry(coord_row, textvariable=self.selected_x_var, width=10).pack(side="left", padx=(4, 10))
         tk.Label(coord_row, text="Y").pack(side="left")
-        tk.Entry(coord_row, textvariable=self.selected_y_var, width=10).pack(side="left", padx=(4, 0))
+        tk.Entry(coord_row, textvariable=self.selected_y_var, width=10).pack(side="left", padx=(4, 10))
+        tk.Label(coord_row, text="Z").pack(side="left")
+        tk.Entry(coord_row, textvariable=self.selected_z_var, width=10).pack(side="left", padx=(4, 0))
         coord_actions = tk.Frame(goto_panel)
         coord_actions.pack(fill="x", pady=(8, 0))
-        tk.Button(coord_actions, text="Use Current XY", command=self.capture_current_stage_position_into_selected).pack(side="left", padx=(0, 6))
+        tk.Button(coord_actions, text="Use Current XYZ", command=self.capture_current_stage_position_into_selected).pack(side="left", padx=(0, 6))
         tk.Button(coord_actions, text="Save Selected Edits", command=self.apply_selected_position_edits).pack(side="left", padx=6)
 
         tl = tk.LabelFrame(frame, text="Timelapse Settings", padx=8, pady=8)
@@ -1247,6 +1359,42 @@ class HeraTriggerApp(tk.Tk):
         tk.Label(tl, textvariable=self.timelapse_status_var, font=("Segoe UI", 10, "bold")).grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
         tk.Label(tl, textvariable=self.time_remaining_var).grid(row=2, column=2, columnspan=2, sticky="w", pady=(10, 0))
 
+    def _build_nis_z_ui(self, parent):
+        frame = tk.LabelFrame(parent, text="NIS Z Bridge", padx=10, pady=10)
+        frame.pack(fill="x", pady=(10, 0))
+
+        conn_row = tk.Frame(frame)
+        conn_row.pack(fill="x", pady=(0, 6))
+        tk.Label(conn_row, text="Shared folder:", fg=self.theme["muted"]).pack(side="left")
+        tk.Entry(conn_row, textvariable=self.nis_z_shared_root_var, width=32).pack(side="left", padx=(6, 0))
+
+        z_row = tk.Frame(frame)
+        z_row.pack(fill="x", pady=(6, 6))
+        tk.Label(z_row, text="NIS Z position:").pack(side="left")
+        tk.Label(z_row, textvariable=self.nis_z_current_z_var, fg=self.theme["accent_soft"],
+                 font=("Segoe UI Semibold", 10)).pack(side="left", padx=(8, 0))
+
+        btns = tk.Frame(frame)
+        btns.pack(fill="x", pady=(0, 8))
+        tk.Button(btns, text="GET Z", command=self._nis_z_get).pack(side="left", padx=(0, 6))
+        tk.Button(btns, text="STOP Z", command=self._nis_z_stop).pack(side="left")
+
+        rel_frame = tk.LabelFrame(frame, text="Relative Move (um)", padx=8, pady=6)
+        rel_frame.pack(fill="x", pady=(0, 8))
+        step_row = tk.Frame(rel_frame)
+        step_row.pack(fill="x", pady=(0, 4))
+        tk.Label(step_row, text="Step (um):").pack(side="left")
+        tk.Entry(step_row, textvariable=self.nis_z_step_var, width=8).pack(side="left", padx=(6, 0))
+        btn_row = tk.Frame(rel_frame)
+        btn_row.pack(fill="x")
+        tk.Button(btn_row, text="Move +", command=lambda: self._nis_z_move_step(+1)).pack(side="left", padx=(0, 6))
+        tk.Button(btn_row, text="Move -", command=lambda: self._nis_z_move_step(-1)).pack(side="left")
+
+        timeout_row = tk.Frame(frame)
+        timeout_row.pack(fill="x")
+        tk.Label(timeout_row, text="Response timeout (s):").pack(side="left")
+        tk.Entry(timeout_row, textvariable=self.nis_z_timeout_var, width=5).pack(side="left", padx=(6, 0))
+
     def _build_log_ui(self, parent):
         state_frame = tk.LabelFrame(parent, text="Run Console", padx=10, pady=10)
         state_frame.pack(fill="x")
@@ -1260,6 +1408,8 @@ class HeraTriggerApp(tk.Tk):
         tk.Label(state_frame, textvariable=self.current_cycle_var, fg="#9aa6b2").pack(side="left")
         ttk.Separator(state_frame, orient="vertical", style="Dark.TSeparator").pack(side="left", fill="y", padx=12)
         tk.Label(state_frame, textvariable=self.current_site_var, fg="#9aa6b2").pack(side="left")
+        ttk.Separator(state_frame, orient="vertical", style="Dark.TSeparator").pack(side="left", fill="y", padx=12)
+        tk.Label(state_frame, textvariable=self.nis_z_status_var, fg=self.theme["accent_soft"]).pack(side="left")
 
         views_frame = tk.LabelFrame(parent, text="Views", padx=10, pady=10)
         views_frame.pack(fill="both", expand=True, pady=(10, 10))
@@ -1327,13 +1477,15 @@ class HeraTriggerApp(tk.Tk):
 
         center_tree_wrap = tk.Frame(pos_frame)
         center_tree_wrap.pack(fill="both", expand=True)
-        self.positions_tree = ttk.Treeview(center_tree_wrap, columns=("name", "x", "y"), show="headings", height=4, style="Dark.Treeview")
+        self.positions_tree = ttk.Treeview(center_tree_wrap, columns=("name", "x", "y", "z"), show="headings", height=4, style="Dark.Treeview")
         self.positions_tree.heading("name", text="Name")
         self.positions_tree.heading("x", text="X")
         self.positions_tree.heading("y", text="Y")
-        self.positions_tree.column("name", width=300, anchor="w")
-        self.positions_tree.column("x", width=180, anchor="e")
-        self.positions_tree.column("y", width=180, anchor="e")
+        self.positions_tree.heading("z", text="Z")
+        self.positions_tree.column("name", width=260, anchor="w")
+        self.positions_tree.column("x", width=150, anchor="e")
+        self.positions_tree.column("y", width=150, anchor="e")
+        self.positions_tree.column("z", width=150, anchor="e")
         center_scroll = ttk.Scrollbar(center_tree_wrap, orient="vertical", command=self.positions_tree.yview)
         self.positions_tree.configure(yscrollcommand=center_scroll.set)
         self.positions_tree.pack(side="left", fill="both", expand=True)
@@ -1559,6 +1711,63 @@ class HeraTriggerApp(tk.Tk):
             self.log(f"Failed to disconnect stage: {exc}")
             self.update_state("Error")
 
+    def _get_nis_z_controller(self):
+        shared_root = self.nis_z_shared_root_var.get().strip()
+        if self.nis_z is None or str(self.nis_z.shared_root) != shared_root:
+            self.nis_z = NISZBridgeController(shared_root)
+        return self.nis_z
+
+    def _nis_z_get(self):
+        self._log_async("NIS Z GET_Z requested; waiting for NIS bridge response...")
+        self._set_var_async(self.nis_z_status_var, "NIS Z: GET_Z waiting")
+        def worker():
+            with self.nis_z_request_lock:
+                try:
+                    z = self._get_nis_z_controller().get_z(timeout_sec=int(self.nis_z_timeout_var.get()))
+                    self._safe_after(0, lambda: self._set_nis_z_value(z))
+                    self._set_var_async(self.nis_z_status_var, f"NIS Z: {z:.3f} um")
+                    self._log_async(f"NIS Z GET_Z: {z:.3f} um")
+                except Exception as exc:
+                    self._log_async(f"NIS Z GET_Z failed: {exc}")
+                    self._set_var_async(self.nis_z_status_var, "NIS Z: GET_Z failed")
+                    self._safe_after(0, lambda: self.nis_z_current_z_var.set("Z: error"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _nis_z_move_rel(self, dz):
+        self._set_var_async(self.nis_z_status_var, f"NIS Z: MOVE_REL {dz:+.3f} waiting")
+        def worker():
+            with self.nis_z_request_lock:
+                try:
+                    self._log_async(f"NIS Z: sending MOVE_REL {dz:+.6f}; waiting for NIS macro response...")
+                    z = self._get_nis_z_controller().move_rel(dz, timeout_sec=int(self.nis_z_timeout_var.get()))
+                    self._safe_after(0, lambda: self._set_nis_z_value(z))
+                    self._set_var_async(self.nis_z_status_var, f"NIS Z: {z:.3f} um")
+                    self._log_async(f"NIS Z after MOVE_REL: {z:.3f} um")
+                except Exception as exc:
+                    self._log_async(f"NIS Z MOVE_REL {dz:+.6f} failed: {exc}")
+                    self._set_var_async(self.nis_z_status_var, "NIS Z: MOVE_REL failed")
+                    self._safe_after(0, lambda: self.nis_z_current_z_var.set("Z: error"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _nis_z_move_step(self, sign):
+        try:
+            step = abs(float(self.nis_z_step_var.get()))
+        except ValueError:
+            self._log_async("NIS Z: invalid step value")
+            return
+        self._nis_z_move_rel(sign * step)
+
+    def _nis_z_stop(self):
+        def worker():
+            with self.nis_z_request_lock:
+                try:
+                    z = self._get_nis_z_controller().stop(timeout_sec=int(self.nis_z_timeout_var.get()))
+                    self._safe_after(0, lambda: self._set_nis_z_value(z))
+                    self._log_async(f"NIS Z STOP: Z={z:.3f} um")
+                except Exception as exc:
+                    self._log_async(f"NIS Z STOP failed: {exc}")
+        threading.Thread(target=worker, daemon=True).start()
+
     def apply_stage_motion_settings(self):
         if not self.tango or not self.tango.connected:
             self.log("Connect the stage before applying motion settings.")
@@ -1581,7 +1790,8 @@ class HeraTriggerApp(tk.Tk):
         if self.tango and self.tango.connected:
             try:
                 x, y, _, _ = self.tango.get_position()
-                self.stage_position_var.set(f"X: {x:.3f}, Y: {y:.3f}")
+                z_text = self.nis_z_current_z_var.get() if hasattr(self, "nis_z_current_z_var") else "Z: -"
+                self.stage_position_var.set(f"X: {x:.3f}, Y: {y:.3f}, {z_text}")
                 self.current_x_label.config(text=f"X: {x:.3f}")
                 self.current_y_label.config(text=f"Y: {y:.3f}")
                 self._draw_live_view_placeholder()
@@ -1590,6 +1800,9 @@ class HeraTriggerApp(tk.Tk):
 
     def start_stage_polling(self):
         self._poll_stage_position()
+
+    def start_nis_z_polling(self):
+        self._poll_nis_z_position()
 
     def _safe_after(self, delay_ms, callback):
         if self.is_closing or not self.winfo_exists():
@@ -1606,6 +1819,63 @@ class HeraTriggerApp(tk.Tk):
         self.update_stage_position_display()
         self._update_time_remaining()
         self.stage_poll_job = self._safe_after(250, self._poll_stage_position)
+
+    def _set_nis_z_value(self, z, status="ok"):
+        self.nis_z_last_value = z
+        self.nis_z_last_status = status
+        self.nis_z_current_z_var.set(f"Z: {z:.3f} um")
+        self.nis_z_status_var.set(f"NIS Z: {z:.3f} um")
+        if hasattr(self, "selected_z_var") and not self.selected_z_var.get().strip():
+            self.selected_z_var.set(f"{z:.3f}")
+        if self.selected_position_index is not None and 0 <= self.selected_position_index < len(self.positions):
+            position = self.positions[self.selected_position_index]
+            try:
+                saved_z_blank = math.isnan(float(position.z))
+            except Exception:
+                saved_z_blank = True
+            if saved_z_blank:
+                position.z = z
+                self.refresh_positions_tree()
+        self.update_stage_position_display()
+
+    def _set_nis_z_status(self, status):
+        self.nis_z_last_status = status
+        if self.nis_z_last_value is None:
+            self.nis_z_current_z_var.set(f"Z: {status}")
+            self.nis_z_status_var.set(f"NIS Z: {status}")
+
+    def _read_nis_z_for_log(self):
+        with self.nis_z_request_lock:
+            try:
+                z = self._get_nis_z_controller().get_z(timeout_sec=int(self.nis_z_timeout_var.get()))
+                self._set_var_async(self.nis_z_current_z_var, f"Z: {z:.3f} um")
+                self.nis_z_last_value = z
+                self.nis_z_last_status = "ok"
+                self._safe_after(0, lambda z=z: self._set_nis_z_value(z))
+                return z, "ok"
+            except Exception as exc:
+                self.nis_z_last_status = str(exc)
+                return None, str(exc)
+
+    def _poll_nis_z_position(self):
+        if self.is_closing:
+            self.nis_z_poll_job = None
+            return
+        if not self.nis_z_poll_inflight and self.nis_z_request_lock.acquire(blocking=False):
+            self.nis_z_poll_inflight = True
+
+            def worker():
+                try:
+                    z = self._get_nis_z_controller().get_z(timeout_sec=3)
+                    self._safe_after(0, lambda: self._set_nis_z_value(z))
+                except Exception as exc:
+                    self._safe_after(0, lambda exc=exc: self._set_nis_z_status(str(exc)))
+                finally:
+                    self.nis_z_poll_inflight = False
+                    self.nis_z_request_lock.release()
+
+            threading.Thread(target=worker, daemon=True).start()
+        self.nis_z_poll_job = self._safe_after(self.nis_z_poll_interval_ms, self._poll_nis_z_position)
 
     def preflight_check(self):
         self.log("Running preflight checks...")
@@ -2049,6 +2319,23 @@ class HeraTriggerApp(tk.Tk):
         self._arm_and_start_acquisition(export_tag=export_tag)
         return self._await_acquisition_completion()
 
+    def _format_saved_z(self, z):
+        if z is None:
+            return ""
+        try:
+            if math.isnan(float(z)):
+                return ""
+        except Exception:
+            return ""
+        return f"{float(z):.3f}"
+
+    def _current_cached_z(self):
+        return self.nis_z_last_value if self.nis_z_last_value is not None else math.nan
+
+    def _parse_optional_z(self, text):
+        text = text.strip()
+        return float(text) if text else math.nan
+
     def add_current_position(self):
         try:
             if not self.tango or not self.tango.connected:
@@ -2056,12 +2343,13 @@ class HeraTriggerApp(tk.Tk):
             x, y, _, _ = self.tango.get_position()
             requested_name = self.position_name_var.get().strip() or f"Site_{len(self.positions) + 1}"
             name = self._unique_position_name(requested_name)
-            self.positions.append(SavedPosition(name, x, y))
+            z = self._current_cached_z()
+            self.positions.append(SavedPosition(name, x, y, z))
             self.selected_position_index = len(self.positions) - 1
             self._populate_selected_position_fields(self.positions[self.selected_position_index])
             self.refresh_positions_tree()
             self.position_name_var.set("")
-            self.log(f"Added position {name} at X={x:.3f}, Y={y:.3f}.")
+            self.log(f"Added position {name} at X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}.")
         except Exception as exc:
             self.log(f"Failed to add position: {exc}")
             self.update_state("Error")
@@ -2070,7 +2358,7 @@ class HeraTriggerApp(tk.Tk):
         for item in self.positions_tree.get_children():
             self.positions_tree.delete(item)
         for index, pos in enumerate(self.positions):
-            self.positions_tree.insert("", "end", iid=str(index), values=(pos.name, f"{pos.x:.3f}", f"{pos.y:.3f}"))
+            self.positions_tree.insert("", "end", iid=str(index), values=(pos.name, f"{pos.x:.3f}", f"{pos.y:.3f}", self._format_saved_z(pos.z)))
         if self.selected_position_index is None and self.positions:
             self.selected_position_index = 0
         if self.selected_position_index is not None and 0 <= self.selected_position_index < len(self.positions):
@@ -2080,7 +2368,8 @@ class HeraTriggerApp(tk.Tk):
             self.center_stage_summary_var.set(
                 f"Selected position: {self.positions[self.selected_position_index].name}  |  "
                 f"X={self.positions[self.selected_position_index].x:.3f}  "
-                f"Y={self.positions[self.selected_position_index].y:.3f}"
+                f"Y={self.positions[self.selected_position_index].y:.3f}  "
+                f"Z={self._format_saved_z(self.positions[self.selected_position_index].z) or '-'}"
             )
         else:
             self._clear_selected_position_fields()
@@ -2092,7 +2381,7 @@ class HeraTriggerApp(tk.Tk):
             self.selected_position_index = int(selection[0])
             position = self.positions[self.selected_position_index]
             self._populate_selected_position_fields(position)
-            self.center_stage_summary_var.set(f"Selected position: {position.name}  |  X={position.x:.3f}  Y={position.y:.3f}")
+            self.center_stage_summary_var.set(f"Selected position: {position.name}  |  X={position.x:.3f}  Y={position.y:.3f}  Z={self._format_saved_z(position.z) or '-'}")
         else:
             self.selected_position_index = None
             self._clear_selected_position_fields()
@@ -2102,23 +2391,27 @@ class HeraTriggerApp(tk.Tk):
         self.selected_name_var.set(position.name)
         self.selected_x_var.set(f"{position.x:.3f}")
         self.selected_y_var.set(f"{position.y:.3f}")
+        self.selected_z_var.set(self._format_saved_z(position.z))
 
     def _clear_selected_position_fields(self):
         self.selected_name_var.set("")
         self.selected_x_var.set("")
         self.selected_y_var.set("")
+        self.selected_z_var.set("")
 
     def capture_current_stage_position_into_selected(self):
         try:
             if not self.tango or not self.tango.connected:
-                raise RuntimeError("Connect the stage before capturing current XY.")
+                raise RuntimeError("Connect the stage before capturing current XYZ.")
             x, y, _, _ = self.tango.get_position()
+            z = self._current_cached_z()
             if not self.selected_name_var.get().strip():
                 default_name = f"Site_{len(self.positions) + 1}" if self.selected_position_index is None else self.positions[self.selected_position_index].name
                 self.selected_name_var.set(default_name)
             self.selected_x_var.set(f"{x:.3f}")
             self.selected_y_var.set(f"{y:.3f}")
-            self.log(f"Loaded current stage position into editor: X={x:.3f}, Y={y:.3f}")
+            self.selected_z_var.set(self._format_saved_z(z))
+            self.log(f"Loaded current stage position into editor: X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}")
         except Exception as exc:
             self.log(f"Failed to capture current stage position: {exc}")
             self.update_state("Error")
@@ -2131,16 +2424,18 @@ class HeraTriggerApp(tk.Tk):
                 raise RuntimeError("Enter a position name first.")
             x = float(self.selected_x_var.get())
             y = float(self.selected_y_var.get())
+            z = self._parse_optional_z(self.selected_z_var.get())
             if self.selected_position_index is None:
-                self.positions.append(SavedPosition(name, x, y))
+                self.positions.append(SavedPosition(name, x, y, z))
                 self.selected_position_index = len(self.positions) - 1
-                self.log(f"Added new position {name} at X={x:.3f}, Y={y:.3f}.")
+                self.log(f"Added new position {name} at X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}.")
             else:
                 position = self.positions[self.selected_position_index]
                 position.name = name
                 position.x = x
                 position.y = y
-                self.log(f"Saved edits for {name}: X={x:.3f}, Y={y:.3f}.")
+                position.z = z
+                self.log(f"Saved edits for {name}: X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}.")
             self._populate_selected_position_fields(self.positions[self.selected_position_index])
             self.refresh_positions_tree()
         except Exception as exc:
@@ -2160,9 +2455,10 @@ class HeraTriggerApp(tk.Tk):
             x, y, _, _ = self.tango.get_position()
             position.x = x
             position.y = y
+            position.z = self._current_cached_z()
             self._populate_selected_position_fields(position)
             self.refresh_positions_tree()
-            self.log(f"Updated {position.name} to X={x:.3f}, Y={y:.3f}.")
+            self.log(f"Updated {position.name} to X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(position.z) or '-'}.")
         except Exception as exc:
             self.log(f"Failed to update selected position: {exc}")
             self.update_state("Error")
@@ -2301,12 +2597,15 @@ class HeraTriggerApp(tk.Tk):
 
                     export_path = self.run_stage_site_acquisition(position, cycle_index=cycle)
                     x, y, _, _ = self.tango.get_position()
+                    z, z_status = self._read_nis_z_for_log()
                     self.trigger_log.append(
                         {
                             "Cycle": cycle,
                             "Site": position.name,
                             "X": f"{x:.6f}",
                             "Y": f"{y:.6f}",
+                            "Z": f"{z:.6f}" if z is not None else "",
+                            "ZStatus": z_status,
                             "Timestamp": datetime.now().isoformat(timespec="seconds"),
                             "ExportPath": export_path,
                             "Status": "confirmed",
@@ -2356,7 +2655,7 @@ class HeraTriggerApp(tk.Tk):
         os.makedirs(output_dir, exist_ok=True)
         log_path = os.path.join(output_dir, f"hera_tango_trigger_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
         with open(log_path, "w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=["Cycle", "Site", "X", "Y", "Timestamp", "ExportPath", "Status"])
+            writer = csv.DictWriter(csv_file, fieldnames=["Cycle", "Site", "X", "Y", "Z", "ZStatus", "Timestamp", "ExportPath", "Status"])
             writer.writeheader()
             writer.writerows(self.trigger_log)
         self._log_async(f"Trigger log saved: {log_path}")
@@ -2851,6 +3150,12 @@ class HeraTriggerApp(tk.Tk):
             pass
         self.stage_poll_job = None
         try:
+            if self.nis_z_poll_job:
+                self.after_cancel(self.nis_z_poll_job)
+        except Exception:
+            pass
+        self.nis_z_poll_job = None
+        try:
             if self.live_watchdog_job:
                 self.after_cancel(self.live_watchdog_job)
         except Exception:
@@ -2887,3 +3192,4 @@ class HeraTriggerApp(tk.Tk):
 if __name__ == "__main__":
     app = HeraTriggerApp()
     app.mainloop()
+

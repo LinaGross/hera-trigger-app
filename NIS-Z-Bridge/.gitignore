@@ -1,0 +1,12 @@
+__pycache__/
+commands/
+responses/
+processed/
+errors/
+state/
+*.log
+sync_stdout.log
+sync_stderr.log
+nis_z_local_fixed_get_probe.mac
+nis_z_findfiles_probe.mac
+nis_z_local_write_probe.mac

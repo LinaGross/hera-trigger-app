@@ -1,0 +1,31 @@
+// Pure NIS macro fixed GET_Z probe.
+// Copy this file locally to the NIS PC and edit COMMAND_FILE / RESPONSE_FILE to match one pending command id.
+// It avoids FindFiles, parsing, Python, and watcher loops.
+
+#define COMMAND_FILE "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/commands/2bc88eb348c641b5a6e3bd454672cd10.txt"
+#define RESPONSE_FILE "//sti-nas1.rcp.epfl.ch/bios/bios-raw/backups/visible/cell/Jiayi_bios-raw/Z control shared/responses/2bc88eb348c641b5a6e3bd454672cd10.txt"
+
+int main()
+{
+    double z;
+    int rc;
+    char response[256];
+
+    if(ExistFile(COMMAND_FILE) != 1)
+    {
+        WriteFile(RESPONSE_FILE, "ERROR command file not found", 56);
+        return -1;
+    }
+
+    rc = StgGetPosZ(&z, 0);
+    if(rc != 1)
+    {
+        sprintf(response, "ERROR StgGetPosZ failed %d", rc);
+        WriteFile(RESPONSE_FILE, response, strlen(response) * 2);
+        return rc;
+    }
+
+    sprintf(response, "OK %.6f", z);
+    WriteFile(RESPONSE_FILE, response, strlen(response) * 2);
+    return 1;
+}
