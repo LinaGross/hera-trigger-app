@@ -2492,18 +2492,30 @@ class HeraTriggerApp(tk.Tk):
     def goto_selected_position(self):
         try:
             position = self._get_selected_position()
-            if not self.tango or not self.tango.connected:
-                raise RuntimeError("Connect the stage before moving.")
-            with self.stage_lock:
-                self.apply_stage_motion_settings()
-                self.log(f"Moving to {position.name}.")
-                self.tango.move_absolute_xy(position.x, position.y)
-                self.tango.wait_for_xy_stop(60000)
-                self.update_stage_position_display()
-            self.log(f"Reached {position.name}.")
         except Exception as exc:
             self.log(f"Failed to go to selected position: {exc}")
             self.update_state("Error")
+            return
+
+        def worker():
+            try:
+                if not self.tango or not self.tango.connected:
+                    raise RuntimeError("Connect the stage before moving.")
+                with self.stage_lock:
+                    speed_xy = float(self.stage_speed_var.get())
+                    if speed_xy <= 0:
+                        raise RuntimeError("Stage speed must be greater than zero.")
+                    self.tango.apply_motion_settings(speed_xy=speed_xy, accel_xy=1.0, secure_vel_xy=50.0)
+                    self._log_async(f"Moving to {position.name}.")
+                    self.tango.move_absolute_xy(position.x, position.y)
+                    self.tango.wait_for_xy_stop(60000)
+                    self._safe_after(0, self.update_stage_position_display)
+                self._log_async(f"Reached {position.name}.")
+            except Exception as exc:
+                self._log_async(f"Failed to go to selected position: {exc}")
+                self._safe_after(0, lambda: self.update_state("Error"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def manual_trigger_selected_position(self):
         try:
