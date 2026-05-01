@@ -27,8 +27,7 @@ COMMAND_SUFFIX = ".txt"
 
 COMMAND_SLOT_MAP = {
     "GET_Z": "current_getz",
-    "MOVE_REL 1.000000": "current_move_rel_p1",
-    "MOVE_REL -1.000000": "current_move_rel_m1",
+    # MOVE_REL handled dynamically below (any step value → current_move_rel_custom)
     "MOVE_ABS 4100.000000 4050.000000 7000.000000": "current_move_abs_4100_4050_7000",
     "MOVE_ABS 4200.000000 4000.000000 8100.000000": "current_move_abs_4200_4000_8100",
     "STOP": "current_stop",
@@ -36,8 +35,7 @@ COMMAND_SLOT_MAP = {
 
 RESPONSE_SLOT_MAP = {
     "current_getz_response.txt": "current_getz",
-    "current_move_rel_p1_response.txt": "current_move_rel_p1",
-    "current_move_rel_m1_response.txt": "current_move_rel_m1",
+    "current_move_rel_custom_response.txt": "current_move_rel_custom",
     "current_move_abs_4100_4050_7000_response.txt": "current_move_abs_4100_4050_7000",
     "current_move_abs_4200_4000_8100_response.txt": "current_move_abs_4200_4000_8100",
     "current_stop_response.txt": "current_stop",
@@ -110,12 +108,20 @@ def forward_shared_commands() -> int:
 
         try:
             command_text = shared_command.read_text(encoding="ascii").strip()
-            slot_name = COMMAND_SLOT_MAP[command_text]
-        except KeyError:
-            logging.error("Unsupported shared command text: %s", shared_command)
-            continue
         except Exception as exc:
-            logging.exception("Failed to parse shared command %s: %s", shared_command, exc)
+            logging.exception("Failed to read shared command %s: %s", shared_command, exc)
+            continue
+
+        # Route any MOVE_REL to the generic custom slot; write only the numeric delta so
+        # the NIS macro can parse it with ReadFile + atof (no hardcoded step required).
+        if command_text.startswith("MOVE_REL "):
+            slot_name = "current_move_rel_custom"
+            local_content = command_text[len("MOVE_REL "):] + "\n"
+        elif command_text in COMMAND_SLOT_MAP:
+            slot_name = COMMAND_SLOT_MAP[command_text]
+            local_content = command_text + "\n"
+        else:
+            logging.error("Unsupported shared command text in %s: %r", shared_command, command_text)
             continue
 
         local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
@@ -125,7 +131,7 @@ def forward_shared_commands() -> int:
             continue
 
         try:
-            write_text_file(local_command, command_text + "\n")
+            write_text_file(local_command, local_content)
             write_text_file(slot_state, shared_command.stem + "\n")
             shared_command.replace(archived_command)
             logging.info(

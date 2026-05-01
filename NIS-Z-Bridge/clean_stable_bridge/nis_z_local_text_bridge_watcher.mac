@@ -1,8 +1,11 @@
 int main()
 {
     double z;
+    double dz;
+    double target_z;
     int rc;
     char response[256];
+    char dz_str[64];
 
     WriteFile("E:/Jiayi/NISZBridge/responses/watcher_started.txt", "started", 20);
 
@@ -101,6 +104,41 @@ int main()
         sprintf(response, "OK %.6f", z);
         WriteFile("E:/Jiayi/NISZBridge/responses/current_move_abs_4200_4000_8100_response.txt", response, strlen(response) * 2);
         RenameFile("E:/Jiayi/NISZBridge/processed/current_move_abs_4200_4000_8100.txt", "E:/Jiayi/NISZBridge/commands/current_move_abs_4200_4000_8100.txt");
+        return 1;
+    }
+
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_move_rel_custom.txt") == 1)
+    {
+        ReadFile("E:/Jiayi/NISZBridge/commands/current_move_rel_custom.txt", dz_str, 64);
+        dz = atof(dz_str);
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ before MOVE_REL failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_custom_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_custom.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_custom.txt");
+            return rc;
+        }
+        target_z = z + dz;
+        rc = StgMoveZ(target_z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgMoveZ absolute failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_custom_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_custom.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_custom.txt");
+            return rc;
+        }
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ after MOVE_REL failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_custom_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_move_rel_custom.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_custom.txt");
+            return rc;
+        }
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_move_rel_custom_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_move_rel_custom.txt", "E:/Jiayi/NISZBridge/commands/current_move_rel_custom.txt");
         return 1;
     }
 
