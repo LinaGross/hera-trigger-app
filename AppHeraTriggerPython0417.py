@@ -1074,6 +1074,7 @@ class HeraTriggerApp(tk.Tk):
         self.nis_z_status_var = tk.StringVar(value="NIS Z: idle")
         self.nis_z_timeout_var = tk.IntVar(value=90)
         self.nis_z_step_var = tk.StringVar(value="1.0")
+        self.nis_z_tolerance_var = tk.DoubleVar(value=0.5)
         self.nis_z_last_value = None
         self.nis_z_last_status = "not checked"
         self.nis_z_poll_job = None
@@ -1388,6 +1389,12 @@ class HeraTriggerApp(tk.Tk):
         btn_row.pack(fill="x")
         tk.Button(btn_row, text="Move +", command=lambda: self._nis_z_move_step(+1)).pack(side="left", padx=(0, 6))
         tk.Button(btn_row, text="Move -", command=lambda: self._nis_z_move_step(-1)).pack(side="left")
+
+        tol_row = tk.Frame(frame)
+        tol_row.pack(fill="x", pady=(0, 4))
+        tk.Label(tol_row, text="Z tolerance (um):").pack(side="left")
+        tk.Entry(tol_row, textvariable=self.nis_z_tolerance_var, width=6).pack(side="left", padx=(6, 0))
+        tk.Label(tol_row, text="(skip move if already within this range)", fg=self.theme["muted"]).pack(side="left", padx=(8, 0))
 
         timeout_row = tk.Frame(frame)
         timeout_row.pack(fill="x")
@@ -2295,6 +2302,33 @@ class HeraTriggerApp(tk.Tk):
             raise RuntimeError(self.last_acquisition_error or "Hera acquisition failed.")
         return self.last_export_path
 
+    def _move_z_to_position(self, target_z):
+        """Move NIS Z to target_z via GET_Z then MOVE_REL. Blocks until confirmed.
+        Returns (confirmed_z, status_str). Always called from a worker thread."""
+        with self.nis_z_request_lock:
+            timeout = int(self.nis_z_timeout_var.get())
+            tolerance = float(self.nis_z_tolerance_var.get())
+            nis = self._get_nis_z_controller()
+            try:
+                current_z = nis.get_z(timeout_sec=timeout)
+                self._safe_after(0, lambda z=current_z: self._set_nis_z_value(z))
+                dz = target_z - current_z
+                if abs(dz) <= tolerance:
+                    self._log_async(
+                        f"NIS Z already at {current_z:.3f} um (target {target_z:.3f} um, within {tolerance} um)."
+                    )
+                    return current_z, "ok"
+                self._log_async(
+                    f"NIS Z: moving from {current_z:.3f} to {target_z:.3f} um (delta={dz:+.3f} um)..."
+                )
+                confirmed_z = nis.move_rel(dz, timeout_sec=timeout)
+                self._safe_after(0, lambda z=confirmed_z: self._set_nis_z_value(z))
+                self._log_async(f"NIS Z confirmed at {confirmed_z:.3f} um (target {target_z:.3f} um).")
+                return confirmed_z, "ok"
+            except Exception as exc:
+                self._log_async(f"NIS Z move to {target_z:.3f} um failed: {exc}")
+                return None, str(exc)
+
     def run_stage_site_acquisition(self, position, cycle_index=None):
         with self.stage_lock:
             if not self.tango or not self.tango.connected:
@@ -2310,13 +2344,26 @@ class HeraTriggerApp(tk.Tk):
             if dwell > 0:
                 self.log(f"Settling at {position.name} for {dwell:.1f} seconds.")
                 time.sleep(dwell)
+
+        # Move Z after XY is settled. Only proceeds to acquisition once Z is confirmed.
+        confirmed_z = None
+        z_status = "no Z"
+        try:
+            target_z = float(position.z)
+            if not math.isnan(target_z):
+                self._log_async(f"NIS Z: targeting {target_z:.3f} um for {position.name}...")
+                confirmed_z, z_status = self._move_z_to_position(target_z)
+        except (TypeError, ValueError):
+            pass
+
         self.log(f"Starting Hera acquisition at {position.name}.")
         if cycle_index is None:
             export_tag = self._sanitize_export_tag(f"{position.name}_{time.strftime('%Y%m%d_%H%M%S')}")
         else:
             export_tag = self._sanitize_export_tag(f"cycle_{cycle_index:03d}_{position.name}")
         self._arm_and_start_acquisition(export_tag=export_tag)
-        return self._await_acquisition_completion()
+        export_path = self._await_acquisition_completion()
+        return export_path, confirmed_z, z_status
 
     def _format_saved_z(self, z):
         if z is None:
@@ -2527,8 +2574,9 @@ class HeraTriggerApp(tk.Tk):
 
         def worker():
             try:
-                export_path = self.run_stage_site_acquisition(position)
-                self._log_async(f"Manual site run completed for {position.name}: {export_path}")
+                export_path, confirmed_z, _ = self.run_stage_site_acquisition(position)
+                z_info = f", Z={confirmed_z:.3f} um" if confirmed_z is not None else ""
+                self._log_async(f"Manual site run completed for {position.name}{z_info}: {export_path}")
             except Exception as exc:
                 self._log_async(f"Manual site run failed: {exc}")
                 self._safe_after(0, lambda: self.update_state("Error"))
@@ -2606,16 +2654,15 @@ class HeraTriggerApp(tk.Tk):
                     if self.timelapse_stop_event.is_set():
                         break
 
-                    export_path = self.run_stage_site_acquisition(position, cycle_index=cycle)
+                    export_path, confirmed_z, z_status = self.run_stage_site_acquisition(position, cycle_index=cycle)
                     x, y, _, _ = self.tango.get_position()
-                    z, z_status = self._read_nis_z_for_log()
                     self.trigger_log.append(
                         {
                             "Cycle": cycle,
                             "Site": position.name,
                             "X": f"{x:.6f}",
                             "Y": f"{y:.6f}",
-                            "Z": f"{z:.6f}" if z is not None else "",
+                            "Z": f"{confirmed_z:.6f}" if confirmed_z is not None else "",
                             "ZStatus": z_status,
                             "Timestamp": datetime.now().isoformat(timespec="seconds"),
                             "ExportPath": export_path,
