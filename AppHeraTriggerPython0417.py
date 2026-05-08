@@ -942,7 +942,15 @@ class NISZBridgeController:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             if response_path.exists():
-                raw = response_path.read_bytes()
+                try:
+                    raw = response_path.read_bytes()
+                except PermissionError:
+                    time.sleep(0.25)
+                    continue
+                except OSError:
+                    time.sleep(0.25)
+                    continue
+
                 if len(raw) > 1 and raw[1] == 0:
                     response = raw.decode("utf-16-le", errors="replace").replace("\x00", "").strip()
                 else:
