@@ -28,8 +28,7 @@ LOG_PATH = LOCAL_ROOT / "nis_z_sync.log"
 POLL_INTERVAL_SECONDS = 1.0
 COMMAND_SUFFIX = ".txt"
 STALE_SLOT_SECONDS = 120.0
-SHARED_COMMAND_MAX_AGE_SECONDS = 1800.0
-SHARED_COMMAND_STARTUP_GRACE_SECONDS = 10.0
+SHARED_COMMAND_MAX_AGE_SECONDS = 180.0
 COMMAND_TIMESTAMP_RE = re.compile(r"(20\d{6}_\d{6})")
 
 COMMAND_SLOT_MAP = {
@@ -60,7 +59,6 @@ EXPECTED_LOCAL_RESPONSE_NAMES = set(RESPONSE_SLOT_MAP)
 
 _STOP_REQUESTED = False
 _LAST_STALE_BACKLOG_LOG_AT = 0.0
-_BRIDGE_STARTED_AT = time.time()
 
 
 def configure_logging() -> None:
@@ -132,7 +130,6 @@ def newest_fresh_shared_command() -> Path | None:
     now = time.time()
     fresh_commands = []
     stale_count = 0
-    pre_start_count = 0
     unknown_timestamp_count = 0
 
     for command in commands:
@@ -146,19 +143,14 @@ def newest_fresh_shared_command() -> Path | None:
             stale_count += 1
             continue
 
-        if timestamp < _BRIDGE_STARTED_AT - SHARED_COMMAND_STARTUP_GRACE_SECONDS:
-            pre_start_count += 1
-            continue
-
         fresh_commands.append(command)
 
-    if stale_count or pre_start_count:
+    if stale_count:
         elapsed = now - _LAST_STALE_BACKLOG_LOG_AT
         if elapsed > 30.0:
             logging.info(
-                "Ignoring %d stale shared command file(s) and %d pre-start command file(s); %d fresh file(s), %d without timestamp.",
+                "Ignoring %d stale shared command file(s); %d fresh file(s), %d without timestamp.",
                 stale_count,
-                pre_start_count,
                 len(fresh_commands),
                 unknown_timestamp_count,
             )
