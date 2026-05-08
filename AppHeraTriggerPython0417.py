@@ -1724,6 +1724,10 @@ class HeraTriggerApp(tk.Tk):
         return self.nis_z
 
     def _nis_z_get(self):
+        if self.nis_z_request_lock.locked():
+            self._log_async("NIS Z GET_Z ignored because another Z request is still waiting.")
+            self._set_var_async(self.nis_z_status_var, "NIS Z: busy")
+            return
         self._log_async("NIS Z GET_Z requested; waiting for NIS bridge response...")
         self._set_var_async(self.nis_z_status_var, "NIS Z: GET_Z waiting")
         def worker():

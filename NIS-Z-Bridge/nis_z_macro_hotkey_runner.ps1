@@ -7,6 +7,7 @@ param(
     [int]$DebounceMilliseconds = 1000
 )
 
+Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -AssemblyName System.Windows.Forms
 
 $seen = @{}
@@ -26,20 +27,20 @@ function Get-NisWindowProcess {
 }
 
 function Send-NisRunHotkey {
+    param([string]$CommandName)
+
     $process = Get-NisWindowProcess
     if (-not $process) {
-        Write-Host "$(Get-Date -Format s) Could not find NIS window containing '$WindowTitleContains'."
+        Write-Host "$(Get-Date -Format s) Command '$CommandName' is waiting, but no NIS window containing '$WindowTitleContains' was found."
         return $false
     }
 
     [Microsoft.VisualBasic.Interaction]::AppActivate($process.Id) | Out-Null
     Start-Sleep -Milliseconds 200
     [System.Windows.Forms.SendKeys]::SendWait($RunHotkey)
-    Write-Host "$(Get-Date -Format s) Sent $RunHotkey to '$($process.MainWindowTitle)'."
+    Write-Host "$(Get-Date -Format s) Command '$CommandName' found. Sent $RunHotkey to '$($process.MainWindowTitle)'."
     return $true
 }
-
-Add-Type -AssemblyName Microsoft.VisualBasic
 
 while ($true) {
     if (Test-Path -LiteralPath $StopFile) {
@@ -62,13 +63,13 @@ while ($true) {
             continue
         }
 
-        $seen[$key] = $stamp
         $elapsed = ((Get-Date) - $lastHotkeyAt).TotalMilliseconds
         if ($elapsed -lt $DebounceMilliseconds) {
             Start-Sleep -Milliseconds ([int]($DebounceMilliseconds - $elapsed))
         }
 
-        if (Send-NisRunHotkey) {
+        if (Send-NisRunHotkey -CommandName $command.Name) {
+            $seen[$key] = $stamp
             $lastHotkeyAt = Get-Date
         }
     }
