@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import signal
 import sys
@@ -81,10 +82,19 @@ def ensure_directories() -> None:
 
 
 def iter_txt_files(folder: Path) -> Iterable[Path]:
-    return sorted(
-        (path for path in folder.glob(f"*{COMMAND_SUFFIX}") if path.is_file()),
-        key=lambda path: (path.stat().st_mtime, path.name),
-    )
+    # Avoid Path.is_file()/stat() here. On this NAS UNC path, Python stat calls
+    # can hang even though direct file reads work. Filenames are enough because
+    # the bridge only creates .txt command/response files in these folders.
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return []
+
+    return [
+        folder / name
+        for name in sorted(names)
+        if name.lower().endswith(COMMAND_SUFFIX)
+    ]
 
 
 def copy_text_file(source: Path, destination: Path) -> None:
