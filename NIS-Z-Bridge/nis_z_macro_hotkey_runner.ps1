@@ -1,10 +1,13 @@
 param(
     [string]$CommandDir = "E:\Jiayi\NISZBridge\commands",
+    [string]$ResponseDir = "E:\Jiayi\NISZBridge\responses",
     [string]$WindowTitleContains = "NIS-Elements",
     [string]$RunHotkey = "{F4}",
     [string]$StopFile = "E:\Jiayi\NISZBridge\stop_hotkey_runner.txt",
     [int]$PollMilliseconds = 250,
     [int]$DebounceMilliseconds = 1000,
+    [int]$RetrySeconds = 3,
+    [int]$MaxCommandAgeSeconds = 180,
     [string[]]$ExcludeTitleContains = @(
         "Visual Studio Code",
         "Windows PowerShell",
@@ -18,22 +21,25 @@ param(
 Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -AssemblyName System.Windows.Forms
 
-$seen = @{}
+$lastSent = @{}
 $lastHotkeyAt = Get-Date "2000-01-01"
-$startedAtUtc = (Get-Date).ToUniversalTime()
 
 Write-Host "Starting macro hotkey runner. WindowTitleContains='$WindowTitleContains' Hotkey='$RunHotkey'"
 Write-Host "Watching: $CommandDir"
+Write-Host "Responses: $ResponseDir"
 Write-Host "Stop file: $StopFile"
 
-if (Test-Path -LiteralPath $CommandDir) {
-    $existingCommands = Get-ChildItem -LiteralPath $CommandDir -Filter "*.txt" -File -ErrorAction SilentlyContinue
-    foreach ($command in $existingCommands) {
-        $seen[$command.FullName] = $command.LastWriteTimeUtc.Ticks
-    }
+function Get-ResponsePathForCommand {
+    param([string]$CommandName)
 
-    if ($existingCommands.Count -gt 0) {
-        Write-Host "$(Get-Date -Format s) Ignoring $($existingCommands.Count) command file(s) already present at startup. Waiting for a new command."
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($CommandName)
+    switch ($stem) {
+        "current_getz" { return Join-Path $ResponseDir "current_getz_response.txt" }
+        "current_move_rel_custom" { return Join-Path $ResponseDir "current_move_rel_custom_response.txt" }
+        "current_move_abs_4100_4050_7000" { return Join-Path $ResponseDir "current_move_abs_4100_4050_7000_response.txt" }
+        "current_move_abs_4200_4000_8100" { return Join-Path $ResponseDir "current_move_abs_4200_4000_8100_response.txt" }
+        "current_stop" { return Join-Path $ResponseDir "current_stop_response.txt" }
+        default { return $null }
     }
 }
 
@@ -95,14 +101,22 @@ while ($true) {
 
     foreach ($command in $commands) {
         $key = $command.FullName
-        $stamp = $command.LastWriteTimeUtc.Ticks
-        if ($seen.ContainsKey($key) -and $seen[$key] -eq $stamp) {
+
+        $ageSeconds = ((Get-Date).ToUniversalTime() - $command.LastWriteTimeUtc).TotalSeconds
+        if ($ageSeconds -gt $MaxCommandAgeSeconds) {
             continue
         }
 
-        if ($command.LastWriteTimeUtc -lt $startedAtUtc) {
-            $seen[$key] = $stamp
+        $responsePath = Get-ResponsePathForCommand -CommandName $command.Name
+        if ($responsePath -and (Test-Path -LiteralPath $responsePath)) {
             continue
+        }
+
+        if ($lastSent.ContainsKey($key)) {
+            $retryElapsed = ((Get-Date) - $lastSent[$key]).TotalSeconds
+            if ($retryElapsed -lt $RetrySeconds) {
+                continue
+            }
         }
 
         $elapsed = ((Get-Date) - $lastHotkeyAt).TotalMilliseconds
@@ -111,8 +125,9 @@ while ($true) {
         }
 
         if (Send-NisRunHotkey -CommandName $command.Name) {
-            $seen[$key] = $stamp
-            $lastHotkeyAt = Get-Date
+            $now = Get-Date
+            $lastSent[$key] = $now
+            $lastHotkeyAt = $now
         }
     }
 

@@ -3255,10 +3255,11 @@ class HeraTriggerApp(tk.Tk):
                     pass
             setattr(self, job_attr, None)
         # Destroy the window immediately so it disappears at once.
-        # SDK cleanup runs in a non-daemon thread so resources are released
-        # cleanly before the process exits.
+        # Hardware cleanup runs in the background; the GUI process should not
+        # linger invisibly after the user closes the window.
+        self.quit()
         self.destroy()
-        threading.Thread(target=self._cleanup_hardware, daemon=False).start()
+        threading.Thread(target=self._cleanup_hardware, daemon=True).start()
 
     def _cleanup_hardware(self):
         try:
@@ -3335,8 +3336,20 @@ def _claim_single_instance():
 
 
 if __name__ == "__main__":
-    _single_instance_handle = _claim_single_instance()
-    if _single_instance_handle:
-        app = HeraTriggerApp()
-        app.mainloop()
+    _single_instance_claim = _claim_single_instance()
+    if _single_instance_claim:
+        _single_instance_handle, _single_instance_lock_file = _single_instance_claim
+        try:
+            app = HeraTriggerApp()
+            app.mainloop()
+        finally:
+            try:
+                msvcrt.locking(_single_instance_lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                _single_instance_lock_file.close()
+            except Exception:
+                pass
+            try:
+                ctypes.windll.kernel32.CloseHandle(_single_instance_handle)
+            except Exception:
+                pass
 
