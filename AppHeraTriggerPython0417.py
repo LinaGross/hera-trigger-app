@@ -1,8 +1,11 @@
 import ctypes
 import csv
 import math
+import msvcrt
 import os
+import re
 import socket
+import tempfile
 import threading
 import time
 import uuid
@@ -916,6 +919,13 @@ class NISZBridgeController:
         self.last_command_path = None
         self.last_response_path = None
 
+    def _decode_response_bytes(self, raw):
+        if len(raw) > 1 and raw[1] == 0:
+            response = raw.decode("utf-16-le", errors="replace")
+        else:
+            response = raw.decode("ascii", errors="replace")
+        return response.replace("\x00", "").strip()
+
     def _send_and_wait(self, command_text, timeout_sec=90):
         command_text = command_text.strip()
         valid = (
@@ -951,10 +961,7 @@ class NISZBridgeController:
                     time.sleep(0.25)
                     continue
 
-                if len(raw) > 1 and raw[1] == 0:
-                    response = raw.decode("utf-16-le", errors="replace").replace("\x00", "").strip()
-                else:
-                    response = raw.decode("ascii", errors="replace").replace("\x00", "").strip()
+                response = self._decode_response_bytes(raw)
                 try:
                     response_path.unlink()
                 except OSError:
@@ -969,9 +976,11 @@ class NISZBridgeController:
         )
 
     def _parse_z(self, response):
+        match = re.match(r"^OK\s+([-+]?\d+(?:\.\d+)?)\s*$", response)
+        if match:
+            return float(match.group(1))
         if response.startswith("OK"):
-            parts = response.split(None, 1)
-            return float(parts[1]) if len(parts) == 2 else 0.0
+            raise RuntimeError(f"NIS Z bridge returned malformed OK response: {response!r}")
         raise RuntimeError(f"NIS Z bridge error: {response}")
 
     def get_z(self, timeout_sec=90):
@@ -3292,7 +3301,7 @@ class HeraTriggerApp(tk.Tk):
 
 def _claim_single_instance():
     mutex_name = "Global\\HeraTriggerAppNISZBridgeSingleInstance"
-    handle = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+    handle = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
     if not handle:
         return None
     if ctypes.windll.kernel32.GetLastError() == 183:
@@ -3303,7 +3312,26 @@ def _claim_single_instance():
             0x00000030,
         )
         return None
-    return handle
+
+    lock_path = os.path.join(tempfile.gettempdir(), "hera_trigger_app_nis_z_bridge.lock")
+    try:
+        lock_file = open(lock_path, "a+b")
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "HERA Trigger is already running. Close the existing HERA window before opening it again.",
+            "HERA Trigger",
+            0x00000030,
+        )
+        try:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+        return None
+
+    return handle, lock_file
 
 
 if __name__ == "__main__":
