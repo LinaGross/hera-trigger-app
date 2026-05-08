@@ -969,6 +969,10 @@ class NISZBridgeController:
                 return response
             time.sleep(0.25)
 
+        try:
+            command_path.unlink()
+        except OSError:
+            pass
         raise RuntimeError(
             f"Timed out waiting for shared response {response_path}. "
             f"The command was written to {command_path}. "

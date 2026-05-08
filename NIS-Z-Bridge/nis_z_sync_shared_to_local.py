@@ -257,6 +257,16 @@ def forward_shared_commands() -> int:
             logging.warning("Local slot is busy, leaving shared command in place: %s", slot_name)
             continue
 
+        # Clear any leftover processed command file so the macro's RenameFile
+        # doesn't collide with a stale copy from a previous cycle.
+        processed_command = LOCAL_PROCESSED_DIR / f"{slot_name}.txt"
+        if processed_command.exists():
+            try:
+                processed_command.unlink()
+                logging.info("Cleared stale processed command file: %s", processed_command)
+            except OSError as exc:
+                logging.warning("Could not clear stale processed command %s: %s", processed_command, exc)
+
         try:
             write_text_file(local_command, command_text + "\n")
             write_text_file(slot_state, shared_command.stem + "\n")
