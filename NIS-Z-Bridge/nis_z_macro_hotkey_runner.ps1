@@ -63,6 +63,25 @@ function Test-CompleteResponse {
     return ($text -match '^OK\s+[-+]?\d+\.\d+\s*$')
 }
 
+function Remove-IncompleteResponse {
+    param([string]$Path)
+
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    if (Test-CompleteResponse -Path $Path) {
+        return
+    }
+
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        Write-Host "$(Get-Date -Format s) Removed incomplete response '$Path' before retrying macro."
+    } catch {
+        Write-Host "$(Get-Date -Format s) Could not remove incomplete response '$Path': $($_.Exception.Message)"
+    }
+}
+
 function Get-NisWindowProcess {
     $matches = Get-Process |
         Where-Object {
@@ -131,6 +150,8 @@ while ($true) {
         if (Test-CompleteResponse -Path $responsePath) {
             continue
         }
+
+        Remove-IncompleteResponse -Path $responsePath
 
         if ($lastSent.ContainsKey($key)) {
             $retryElapsed = ((Get-Date) - $lastSent[$key]).TotalSeconds

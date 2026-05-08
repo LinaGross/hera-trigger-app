@@ -278,6 +278,16 @@ def recover_stale_local_slots() -> None:
         if local_response.name not in EXPECTED_LOCAL_RESPONSE_NAMES:
             continue
 
+        try:
+            response_text = read_response_text(local_response)
+        except Exception:
+            response_text = ""
+
+        if response_text and not is_complete_response(response_text) and age_seconds(local_response) > LOCAL_RESPONSE_MIN_AGE_SECONDS:
+            archived = archive_local_file(local_response, LOCAL_ERRORS_DIR, "incomplete_local_response")
+            logging.warning("Archived incomplete local response %s -> %s: %r", local_response, archived, response_text)
+            continue
+
         if age_seconds(local_response) <= STALE_SLOT_SECONDS:
             continue
 
@@ -381,7 +391,13 @@ def publish_local_responses() -> int:
         try:
             response_text = read_response_text(local_response)
             if not is_complete_response(response_text):
-                logging.warning("Waiting for complete local response in %s: %r", local_response, response_text)
+                archived_response = archive_local_file(local_response, LOCAL_ERRORS_DIR, "incomplete_local_response")
+                logging.warning(
+                    "Archived incomplete local response %s -> %s: %r",
+                    local_response,
+                    archived_response,
+                    response_text,
+                )
                 continue
 
             response_id = slot_state.read_text(encoding="ascii").strip()
