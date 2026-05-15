@@ -204,6 +204,10 @@ class HeraController:
             ctypes.c_int,
             [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint],
         )
+        try:
+            self.HeraAPI_ClearROI = self._define_function("HeraAPI_ClearROI", ctypes.c_int, [ctypes.c_void_p])
+        except AttributeError:
+            self.HeraAPI_ClearROI = None
         self.HeraAPI_GetOffsetX = self._define_function("HeraAPI_GetOffsetX", ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)])
         self.HeraAPI_GetOffsetY = self._define_function("HeraAPI_GetOffsetY", ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)])
         self.HeraAPI_GetWidth = self._define_function("HeraAPI_GetWidth", ctypes.c_int, [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)])
@@ -447,6 +451,14 @@ class HeraController:
             if not silent:
                 raise
 
+    def wait_for_live_capture_stopped(self, timeout_sec=5.0):
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if not self.is_live_capturing():
+                return True
+            time.sleep(0.05)
+        raise RuntimeError("Timed out waiting for live capture to stop.")
+
     def get_live_capture_info(self, capture_handle):
         width = ctypes.c_int()
         height = ctypes.c_int()
@@ -518,6 +530,11 @@ class HeraController:
             self.HeraAPI_SetROI(self.device_handle, ctypes.c_uint(x), ctypes.c_uint(y), ctypes.c_uint(width), ctypes.c_uint(height)),
             "Set ROI",
         )
+
+    def clear_roi(self):
+        if not self.HeraAPI_ClearROI:
+            raise RuntimeError("Clear ROI is not available in this Hera SDK DLL.")
+        self.check_status(self.HeraAPI_ClearROI(self.device_handle), "Clear ROI")
 
     def get_roi(self):
         x = ctypes.c_uint()
@@ -1061,6 +1078,7 @@ class HeraTriggerApp(tk.Tk):
         self.dll_path_var = tk.StringVar(value=HeraController.default_dll_path())
         self.env_var = tk.StringVar(value=HeraController.get_hera_devices_path() or "")
         self.license_var = tk.StringVar(value="Unknown")
+        self.license_ok_seen = False
         self.selected_device_var = tk.StringVar(value="(none)")
         self.tango_dll_var = tk.StringVar(value=os.path.join(os.path.abspath(os.path.dirname(__file__)), "Tango_DLL.dll"))
         self.stage_port_var = tk.StringVar(value="COM7")
@@ -1072,6 +1090,7 @@ class HeraTriggerApp(tk.Tk):
         self.current_cycle_var = tk.StringVar(value="Cycle: -")
         self.current_site_var = tk.StringVar(value="Site: -")
         self.last_export_var = tk.StringVar(value="Last export: -")
+        self.hyperlab_shortcut_var = tk.StringVar(value=r"C:\Users\Public\Desktop\Nireos HyperLAB.lnk")
         self.hypercube_summary_var = tk.StringVar(value="Cube: waiting for acquisition")
         self.live_view_status_var = tk.StringVar(value="Live view: waiting for frames")
         self.live_cursor_var = tk.StringVar(value=self._live_cursor_status_text("-"))
@@ -1094,6 +1113,8 @@ class HeraTriggerApp(tk.Tk):
         self.live_roi_selecting = False
         self.live_roi_points = []
         self.live_roi_rect = None
+        self.roi_selection_active = False
+        self.selected_export_roi = None
         self.live_roi_button_var = tk.StringVar(value="Select ROI")
         self.live_roi_status_var = tk.StringVar(value="ROI: -")
         self.latest_stage_xy = None
@@ -1106,6 +1127,8 @@ class HeraTriggerApp(tk.Tk):
         self.last_live_render_time = 0.0
         self.live_render_interval_sec = 0.20
         self.resume_live_after_acquisition = False
+        self.last_applied_roi = None
+        self.acquisition_requested_roi = None
         self.live_max_preview_width = 480
         self.live_auth_warning_logged = False
         self.last_live_decode_error = ""
@@ -1503,7 +1526,7 @@ class HeraTriggerApp(tk.Tk):
         controls = [
             ("Resolution", "scan_mode", "menu", self.SCAN_MODES.keys(), 8),
             ("Bands", "bands", "entry", None, 5),
-            ("Avg", "averages", "entry", None, 4),
+            ("Avg", "averages", "menu", ("1", "2", "3"), 3),
             ("Binning", "binning", "menu", self.BINNING_OPTIONS.keys(), 7),
             ("Stabilize ms", "stabilization", "entry", None, 6),
             ("Data", "data_type", "menu", self.DATA_TYPES.keys(), 13),
@@ -1653,6 +1676,13 @@ class HeraTriggerApp(tk.Tk):
         tk.Button(saving, text="Browse", command=self.browse_output_path).pack(fill="x", pady=(0, 6))
         tk.Label(saving, text="Notes saved in ENVI description").pack(anchor="w", pady=(4, 0))
         tk.Entry(saving, textvariable=self.saving_notes_var, width=30).pack(fill="x", pady=(2, 0))
+        ttk.Separator(saving, orient="horizontal").pack(fill="x", pady=8)
+        tk.Label(saving, text="HyperLAB").pack(anchor="w")
+        tk.Entry(saving, textvariable=self.hyperlab_shortcut_var, width=30).pack(fill="x", pady=(2, 6))
+        hyperlab_buttons = tk.Frame(saving)
+        hyperlab_buttons.pack(fill="x")
+        tk.Button(hyperlab_buttons, text="Browse", command=self.browse_hyperlab_shortcut).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Button(hyperlab_buttons, text="Open Current", command=self.open_current_in_hyperlab).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
     def _build_hera_ui(self, parent):
         frame = tk.LabelFrame(parent, text="Hera Acquisition", padx=8, pady=8)
@@ -2034,6 +2064,53 @@ class HeraTriggerApp(tk.Tk):
         if folder:
             self.param_vars["output_path"].set(folder)
 
+    def browse_hyperlab_shortcut(self):
+        file_path = filedialog.askopenfilename(
+            title="Select Nireos HyperLAB shortcut or application",
+            filetypes=[("Shortcut or executable", "*.lnk *.exe"), ("All files", "*.*")],
+        )
+        if file_path:
+            self.hyperlab_shortcut_var.set(file_path)
+
+    def open_current_in_hyperlab(self):
+        hdr_path = self.last_export_path
+        if not hdr_path or not os.path.exists(hdr_path):
+            messagebox.showinfo("Open in HyperLAB", "No exported hyperspectral cube is available yet.")
+            self.log("Open in HyperLAB skipped: no exported hyperspectral cube is available yet.")
+            return
+
+        shortcut_path = self.hyperlab_shortcut_var.get().strip()
+        if not shortcut_path or not os.path.exists(shortcut_path):
+            messagebox.showerror("Open in HyperLAB", f"HyperLAB shortcut not found:\n{shortcut_path}")
+            self.log(f"Open in HyperLAB failed: shortcut not found: {shortcut_path}")
+            return
+
+        try:
+            try:
+                os.startfile(shortcut_path, "open", f'"{hdr_path}"')
+                self.log(f"Opened current hyperspectral cube in HyperLAB: {hdr_path}")
+            except TypeError:
+                os.startfile(shortcut_path)
+                self._copy_last_export_path_to_clipboard(hdr_path)
+                self.log(f"Opened HyperLAB. Last export path copied to clipboard: {hdr_path}")
+        except Exception as exc:
+            try:
+                os.startfile(shortcut_path)
+                self._copy_last_export_path_to_clipboard(hdr_path)
+                messagebox.showinfo(
+                    "Open in HyperLAB",
+                    "HyperLAB was opened, but Windows did not accept the cube path automatically. "
+                    "The last .hdr path was copied to the clipboard.",
+                )
+                self.log(f"Opened HyperLAB without file argument. Last export path copied to clipboard: {hdr_path}")
+            except Exception as fallback_exc:
+                messagebox.showerror("Open in HyperLAB", f"Could not open HyperLAB:\n{fallback_exc}")
+                self.log(f"Open in HyperLAB failed: {exc}; fallback failed: {fallback_exc}")
+
+    def _copy_last_export_path_to_clipboard(self, hdr_path):
+        self.clipboard_clear()
+        self.clipboard_append(hdr_path)
+
     def auto_connect_devices(self):
         self.log("Auto-connect startup sequence running...")
         try:
@@ -2098,6 +2175,84 @@ class HeraTriggerApp(tk.Tk):
             time.sleep(0.25)
 
         raise RuntimeError(f"Timed out waiting for exported files for {output_base_path}")
+
+    def _find_envi_data_file(self, output_base_path):
+        for candidate in (output_base_path, output_base_path + ".raw", output_base_path + ".img", output_base_path + ".dat"):
+            if os.path.exists(candidate):
+                return candidate
+        raise RuntimeError(f"Could not find ENVI data file for {output_base_path}")
+
+    def _read_envi_header_value(self, header_text, key, default=None):
+        match = re.search(rf"(?im)^\s*{re.escape(key)}\s*=\s*(.+?)\s*$", header_text)
+        if not match:
+            return default
+        return match.group(1).strip()
+
+    def _replace_envi_header_value(self, header_text, key, value):
+        line = f"{key} = {value}"
+        pattern = rf"(?im)^\s*{re.escape(key)}\s*=.*$"
+        if re.search(pattern, header_text):
+            return re.sub(pattern, line, header_text)
+        return header_text.rstrip() + "\n" + line + "\n"
+
+    def _crop_exported_envi_to_roi(self, source_base_path, target_base_path, roi, description=None):
+        source_hdr_path = source_base_path + ".hdr"
+        source_data_path = self._find_envi_data_file(source_base_path)
+        target_hdr_path = target_base_path + ".hdr"
+        target_data_path = target_base_path
+
+        header_text = Path(source_hdr_path).read_text(encoding="utf-8", errors="replace")
+        samples = int(self._read_envi_header_value(header_text, "samples"))
+        lines = int(self._read_envi_header_value(header_text, "lines"))
+        bands = int(self._read_envi_header_value(header_text, "bands"))
+        data_type = int(self._read_envi_header_value(header_text, "data type"))
+        interleave = (self._read_envi_header_value(header_text, "interleave", "bsq") or "bsq").lower()
+        header_offset = int(self._read_envi_header_value(header_text, "header offset", "0"))
+        if interleave != "bsq":
+            raise RuntimeError(f"ROI export crop only supports ENVI bsq interleave, not {interleave}.")
+        bytes_per_sample = {4: 4, 5: 8}.get(data_type)
+        if not bytes_per_sample:
+            raise RuntimeError(f"ROI export crop does not support ENVI data type {data_type}.")
+
+        roi_x, roi_y, roi_w, roi_h = roi
+        roi_x = max(0, min(int(roi_x), samples - 1))
+        roi_y = max(0, min(int(roi_y), lines - 1))
+        roi_w = max(1, min(int(roi_w), samples - roi_x))
+        roi_h = max(1, min(int(roi_h), lines - roi_y))
+        row_bytes = roi_w * bytes_per_sample
+        source_row_bytes = samples * bytes_per_sample
+        source_band_bytes = samples * lines * bytes_per_sample
+
+        with open(source_data_path, "rb") as source_file, open(target_data_path, "wb") as target_file:
+            for band_index in range(bands):
+                band_offset = header_offset + band_index * source_band_bytes
+                for row in range(roi_y, roi_y + roi_h):
+                    source_file.seek(band_offset + row * source_row_bytes + roi_x * bytes_per_sample)
+                    target_file.write(source_file.read(row_bytes))
+
+        cropped_header = header_text
+        if description:
+            safe_description = description.replace("}", ")")
+            cropped_header = self._replace_envi_header_value(cropped_header, "description", f"{{{safe_description}}}")
+        cropped_header = self._replace_envi_header_value(cropped_header, "samples", str(roi_w))
+        cropped_header = self._replace_envi_header_value(cropped_header, "lines", str(roi_h))
+        cropped_header = self._replace_envi_header_value(cropped_header, "header offset", "0")
+        Path(target_hdr_path).write_text(cropped_header, encoding="utf-8")
+        return target_hdr_path
+
+    def _remove_export_files(self, output_base_path):
+        for candidate in (
+            output_base_path,
+            output_base_path + ".hdr",
+            output_base_path + ".raw",
+            output_base_path + ".img",
+            output_base_path + ".dat",
+        ):
+            try:
+                if os.path.exists(candidate):
+                    os.remove(candidate)
+            except Exception as exc:
+                self._log_async(f"Could not remove temporary export file {candidate}: {exc}")
 
     def refresh_device_list(self):
         try:
@@ -2176,6 +2331,7 @@ class HeraTriggerApp(tk.Tk):
                 self.controller.disconnect()
             self.controller.release_device()
             self.license_var.set("Unknown")
+            self.license_ok_seen = False
             self.last_export_var.set("Last export: -")
             self.update_state("Idle")
             self.log("Disconnected from Hera device.")
@@ -2447,23 +2603,39 @@ class HeraTriggerApp(tk.Tk):
         except Exception as exc:
             self.log(f"Failed to read SDK version: {exc}")
 
-    def check_license_status(self):
+    def check_license_status(self, allow_cached=False):
         if not self.controller:
             self.license_var.set("Unknown")
             return False
         try:
             status, licensed, expiry_license, expiry_cert = self.controller.is_licensed()
         except Exception as exc:
+            if allow_cached and self.license_ok_seen:
+                self.license_var.set("Licensed")
+                self.log(f"License recheck failed after an earlier successful check; continuing: {exc}")
+                return True
             self.license_var.set("License check failed")
             self.log(f"License check failed: {exc}")
             return False
         if status != 0:
+            if allow_cached and self.license_ok_seen:
+                self.license_var.set("Licensed")
+                self.log(
+                    "License recheck returned an SDK error after an earlier successful check; "
+                    f"continuing: {self.controller.get_last_error()}"
+                )
+                return True
             self.license_var.set("License check failed")
             self.log(self.controller.get_last_error())
             return False
         if licensed:
             self.license_var.set("Licensed")
+            self.license_ok_seen = True
             self.log(f"Hera SDK is licensed. License expiry UTC={expiry_license}, certificate expiry UTC={expiry_cert}")
+            return True
+        if allow_cached and self.license_ok_seen:
+            self.license_var.set("Licensed")
+            self.log("License recheck reported inactive after an earlier successful check; continuing with acquisition.")
             return True
         self.license_var.set("Not licensed")
         self.log("Hera SDK license is not active.")
@@ -2803,13 +2975,26 @@ class HeraTriggerApp(tk.Tk):
             if self.controller.is_roi_writable():
                 self.controller.set_roi(roi_x, roi_y, roi_w, roi_h)
                 actual_roi = self.controller.get_roi()
+                self.last_applied_roi = actual_roi
                 self._log_async(f"Set ROI: requested=({roi_x}, {roi_y}, {roi_w}, {roi_h}), actual={actual_roi}")
+                if actual_roi != (roi_x, roi_y, roi_w, roi_h):
+                    self._log_async(
+                        "ROI readback differs from the requested ROI. "
+                        "The SDK/camera may have rounded or rejected one of the ROI values."
+                    )
             else:
                 actual_roi = self.controller.get_roi()
+                self.last_applied_roi = actual_roi
                 self._log_async(f"ROI is read-only on this device. Current ROI: {actual_roi}")
             try:
                 actual_x, actual_y, actual_w, actual_h = actual_roi
-                self._safe_after(0, lambda x=actual_x, y=actual_y, w=actual_w, h=actual_h: self._set_roi_fields(x, y, w, h, update_live=True))
+                if self.roi_selection_active:
+                    self._log_async(
+                        f"Keeping selected export ROI {self.selected_export_roi}; camera ROI readback is "
+                        f"({actual_x}, {actual_y}, {actual_w}, {actual_h})."
+                    )
+                else:
+                    self._safe_after(0, lambda x=actual_x, y=actual_y, w=actual_w, h=actual_h: self._set_roi_fields(x, y, w, h, update_live=True))
             except Exception:
                 pass
 
@@ -2833,18 +3018,28 @@ class HeraTriggerApp(tk.Tk):
     def _arm_and_start_acquisition(self, export_tag=None):
         if not self.controller or not self.controller.connected:
             raise RuntimeError("Connect to Hera before starting acquisition.")
-        if not self.check_license_status():
+        if not self.check_license_status(allow_cached=True):
             raise RuntimeError("Hera SDK license is not active.")
         if self.controller.is_acquiring():
             raise RuntimeError("The device is already acquiring.")
 
         live_was_running = self.controller.is_live_capturing()
         self.resume_live_after_acquisition = live_was_running
+        self.acquisition_requested_roi = self.selected_export_roi if self.roi_selection_active else None
+        if self.acquisition_requested_roi:
+            self.log(f"Selected ROI for exported cube: {self.acquisition_requested_roi}")
+        else:
+            self.log("No ROI selected for export; hyperspectral cube will use the full returned image.")
         if not self.apply_parameters(restart_live=False):
             if live_was_running and self.controller and self.controller.connected:
                 self.start_live_view()
                 self.resume_live_after_acquisition = False
             raise RuntimeError("Applying Hera parameters failed.")
+        if self.acquisition_requested_roi:
+            try:
+                self.log(f"Camera ROI after parameter apply: {self.controller.get_roi()}")
+            except Exception as exc:
+                self.log(f"Could not read camera ROI after parameter apply: {exc}")
 
         scan_mode = self.SCAN_MODES[self.param_vars["scan_mode"].get()]
         trigger_mode_name = self.param_vars["trigger_mode"].get()
@@ -3384,6 +3579,14 @@ class HeraTriggerApp(tk.Tk):
         try:
             width, height, _ = self.controller.get_hyperspectral_data_info(data_handle)
             self._log_async(f"Raw hyperspectral data received: width={width}, height={height}")
+            if self.last_applied_roi:
+                roi_x, roi_y, roi_w, roi_h = self.last_applied_roi
+                if (width, height) != (roi_w, roi_h):
+                    self._log_async(
+                        "Warning: raw hyperspectral data size does not match the camera ROI "
+                        f"({roi_w} x {roi_h} at x={roi_x}, y={roi_y}). "
+                        f"The SDK returned {width} x {height}."
+                    )
 
             bands = int(self.param_vars["bands"].get())
             binning = self.BINNING_OPTIONS[self.param_vars["binning"].get()]
@@ -3391,18 +3594,39 @@ class HeraTriggerApp(tk.Tk):
 
             hypercube_handle = self.controller.get_hypercube(data_handle, data_type, bands, binning)
             cube_width, cube_height, cube_bands, cube_type = self.controller.get_hypercube_info(hypercube_handle)
+            display_roi = None
+            display_width = cube_width
+            display_height = cube_height
+            if self.acquisition_requested_roi:
+                roi_x, roi_y, roi_w, roi_h = self.acquisition_requested_roi
+                roi_x = max(0, min(int(roi_x), cube_width - 1))
+                roi_y = max(0, min(int(roi_y), cube_height - 1))
+                roi_w = max(1, min(int(roi_w), cube_width - roi_x))
+                roi_h = max(1, min(int(roi_h), cube_height - roi_y))
+                display_roi = (roi_x, roi_y, roi_w, roi_h)
+                display_width = roi_w
+                display_height = roi_h
             self._set_var_async(
                 self.hypercube_summary_var,
-                f"Cube: {cube_width} x {cube_height}, bands={cube_bands}, type={cube_type}",
+                f"Cube: {display_width} x {display_height}, bands={cube_bands}, type={cube_type}"
+                + (f" (ROI x={display_roi[0]}, y={display_roi[1]})" if display_roi else ""),
             )
             self._log_async(
                 f"Hypercube ready: width={cube_width}, height={cube_height}, bands={cube_bands}, dataType={cube_type}"
             )
+            if display_roi:
+                self._log_async(
+                    f"Hyperspectral viewer will display selected ROI: x={display_roi[0]}, y={display_roi[1]}, "
+                    f"width={display_roi[2]}, height={display_roi[3]}"
+                )
             previous_handle = self.current_hypercube_handle
             self.current_hypercube_handle = hypercube_handle
             self.current_hypercube_info = {
-                "width": cube_width,
-                "height": cube_height,
+                "width": display_width,
+                "height": display_height,
+                "source_width": cube_width,
+                "source_height": cube_height,
+                "display_roi": display_roi,
                 "bands": cube_bands,
                 "data_type": cube_type,
             }
@@ -3432,8 +3656,35 @@ class HeraTriggerApp(tk.Tk):
             notes = self.saving_notes_var.get().strip()
             if notes:
                 description = f"{description}\nUser notes: {notes}"
-            self.controller.export_hypercube_envi(hypercube_handle, output_path, description)
-            hdr_path = self._wait_for_export_files(output_path)
+            requested_roi = self.acquisition_requested_roi
+            should_crop_export = False
+            if requested_roi:
+                roi_x, roi_y, roi_w, roi_h = requested_roi
+                should_crop_export = (roi_x, roi_y, roi_w, roi_h) != (0, 0, cube_width, cube_height)
+
+            if should_crop_export:
+                temp_output_path = f"{output_path}_fullframe_tmp_{uuid.uuid4().hex[:8]}"
+                self._log_async(
+                    "ROI diagnostic: SDK hypercube is "
+                    f"{cube_width} x {cube_height}; selected ROI is "
+                    f"x={requested_roi[0]}, y={requested_roi[1]}, w={requested_roi[2]}, h={requested_roi[3]}. "
+                    "Exporting full cube temporarily, then cropping ENVI output on disk."
+                )
+                self.controller.export_hypercube_envi(hypercube_handle, temp_output_path, description)
+                self._wait_for_export_files(temp_output_path)
+                crop_description = (
+                    f"{description}\n"
+                    f"Post-export ROI crop: x={requested_roi[0]}, y={requested_roi[1]}, "
+                    f"width={requested_roi[2]}, height={requested_roi[3]}"
+                )
+                hdr_path = self._crop_exported_envi_to_roi(temp_output_path, output_path, requested_roi, crop_description)
+                self._remove_export_files(temp_output_path)
+                self._log_async(f"Exported ROI-cropped hypercube and confirmed files: {hdr_path}")
+            else:
+                if requested_roi:
+                    self._log_async("ROI diagnostic: SDK hypercube already matches the selected ROI size; exporting directly.")
+                self.controller.export_hypercube_envi(hypercube_handle, output_path, description)
+                hdr_path = self._wait_for_export_files(output_path)
             self.last_export_path = hdr_path
             self._set_var_async(self.last_export_var, f"Last export: {os.path.basename(hdr_path)}")
             self._log_async(f"Exported hypercube and confirmed files: {hdr_path}")
@@ -3556,6 +3807,49 @@ class HeraTriggerApp(tk.Tk):
         self.live_pan_x = 0.0
         self.live_pan_y = 0.0
         self.live_pan_drag_start = None
+        self._update_live_zoom_label()
+        self._schedule_live_render(force=True)
+
+    def zoom_live_view_to_roi(self, roi_rect=None):
+        if not hasattr(self, "live_view_canvas"):
+            return
+        roi_rect = roi_rect or self.live_roi_rect
+        if not roi_rect:
+            return
+        with self.live_frame_lock:
+            frame = self.latest_live_frame
+            frame_size = self.live_display_frame_size
+        if not frame:
+            return
+        if frame_size:
+            frame_width, frame_height = frame_size
+        else:
+            frame_width, frame_height = frame[0], frame[1]
+        if frame_width <= 0 or frame_height <= 0:
+            return
+
+        roi_x, roi_y, roi_w, roi_h = roi_rect
+        roi_w = max(1, roi_w)
+        roi_h = max(1, roi_h)
+        canvas = self.live_view_canvas
+        canvas_width = max(canvas.winfo_width(), 10)
+        canvas_height = max(canvas.winfo_height(), 10)
+        base_w, base_h = self._fit_dimensions(frame[0], frame[1], max(canvas_width - 16, 1), max(canvas_height - 16, 1))
+        roi_fit_w = max(1.0, roi_w * base_w / frame_width)
+        roi_fit_h = max(1.0, roi_h * base_h / frame_height)
+        zoom_x = (canvas_width * 0.82) / roi_fit_w
+        zoom_y = (canvas_height * 0.82) / roi_fit_h
+        self.live_zoom_factor = max(1.0, min(8.0, zoom_x, zoom_y))
+
+        out_w = max(1, int(round(base_w * self.live_zoom_factor)))
+        out_h = max(1, int(round(base_h * self.live_zoom_factor)))
+        centered_left = (canvas_width - out_w) / 2
+        centered_top = (canvas_height - out_h) / 2
+        roi_center_x = roi_x + (roi_w - 1) / 2.0
+        roi_center_y = roi_y + (roi_h - 1) / 2.0
+        self.live_pan_x = (canvas_width / 2.0) - centered_left - (roi_center_x * out_w / frame_width)
+        self.live_pan_y = (canvas_height / 2.0) - centered_top - (roi_center_y * out_h / frame_height)
+        self._clamp_live_pan(canvas_width, canvas_height, out_w, out_h)
         self._update_live_zoom_label()
         self._schedule_live_render(force=True)
 
@@ -3838,6 +4132,7 @@ class HeraTriggerApp(tk.Tk):
         self.current_hyper_band_var.set("Band: -")
         self.current_hyper_wavelength_var.set("Wavelength: -")
         self.hypercube_summary_var.set("Cube: waiting for acquisition")
+        self.acquisition_requested_roi = None
         self.hyper_photo = None
         if hasattr(self, "hyper_band_scale"):
             self.hyper_band_scale.config(to=0)
@@ -3877,6 +4172,16 @@ class HeraTriggerApp(tk.Tk):
         elif getattr(event, "delta", 0) < 0:
             self.step_hyper_band(-1)
 
+    def _crop_hyper_band_values_for_display(self, band_values, source_width, display_roi):
+        if not display_roi:
+            return band_values
+        roi_x, roi_y, roi_w, roi_h = display_roi
+        cropped = []
+        for row in range(roi_y, roi_y + roi_h):
+            start = row * source_width + roi_x
+            cropped.extend(band_values[start:start + roi_w])
+        return cropped
+
     def render_current_hyper_band(self):
         if not hasattr(self, "hyper_view_canvas"):
             return
@@ -3887,13 +4192,17 @@ class HeraTriggerApp(tk.Tk):
             band_index = min(max(int(self.current_hyper_band_index.get()), 0), self.current_hypercube_info["bands"] - 1)
             self.current_hyper_band_index.set(band_index)
             if band_index not in self.current_hyper_band_cache:
+                source_width = self.current_hypercube_info.get("source_width", self.current_hypercube_info["width"])
+                source_height = self.current_hypercube_info.get("source_height", self.current_hypercube_info["height"])
+                display_roi = self.current_hypercube_info.get("display_roi")
                 wavelength, band_values = self.controller.get_hypercube_band_data(
                     self.current_hypercube_handle,
                     band_index,
-                    self.current_hypercube_info["width"],
-                    self.current_hypercube_info["height"],
+                    source_width,
+                    source_height,
                     self.current_hypercube_info["data_type"],
                 )
+                band_values = self._crop_hyper_band_values_for_display(band_values, source_width, display_roi)
                 min_value = min(band_values)
                 max_value = max(band_values)
                 if math.isclose(min_value, max_value):
@@ -4090,7 +4399,7 @@ class HeraTriggerApp(tk.Tk):
         self.live_roi_points = []
         self.live_roi_selecting = False
         self.live_roi_button_var.set("Select ROI")
-        self._set_roi_fields(left, top, width, height, update_live=True)
+        self._set_roi_fields(left, top, width, height, update_live=True, selected=True)
         self.log(f"Live ROI selected: x={left}, y={top}, width={width}, height={height}. Press Apply Parameters to send it to Hera.")
         self._draw_live_view_placeholder()
 
@@ -4113,12 +4422,15 @@ class HeraTriggerApp(tk.Tk):
         self.live_roi_selecting = False
         self.live_roi_points = []
         self.live_roi_rect = None
+        self.roi_selection_active = False
+        self.selected_export_roi = None
         self.live_roi_button_var.set("Select ROI")
         with self.live_frame_lock:
             frame_size = self.live_display_frame_size
         if frame_size:
             frame_width, frame_height = frame_size
             self._set_roi_fields(0, 0, frame_width, frame_height, update_live=False, status=f"ROI: full frame {frame_width} x {frame_height}")
+            self.fit_live_view()
             self.log(f"Live ROI cleared to full frame: width={frame_width}, height={frame_height}. Press Apply Parameters to send it to Hera.")
         else:
             self.live_roi_status_var.set("ROI: -")
@@ -4137,11 +4449,12 @@ class HeraTriggerApp(tk.Tk):
         height = max(1, self._read_int_var(self.param_vars["roi_h"], "ROI height"))
         return left, top, width, height
 
-    def _set_roi_fields(self, left, top, width, height, update_live=True, status=None):
+    def _set_roi_fields(self, left, top, width, height, update_live=True, status=None, selected=False):
         left = int(left)
         top = int(top)
         width = max(1, int(width))
         height = max(1, int(height))
+        roi_rect = (left, top, width, height)
         self.param_vars["roi_x"].set(left)
         self.param_vars["roi_y"].set(top)
         self.param_vars["roi_w"].set(width)
@@ -4158,13 +4471,18 @@ class HeraTriggerApp(tk.Tk):
         self.roi_bl_y_var.set(bottom)
         self.roi_area_var.set(str(width * height))
         if update_live:
-            self.live_roi_rect = (left, top, width, height)
+            self.live_roi_rect = roi_rect
+        if selected:
+            self.roi_selection_active = True
+            self.selected_export_roi = roi_rect
         self.live_roi_status_var.set(status or f"ROI: x={left}, y={top}, w={width}, h={height}, area={width * height}")
+        if update_live:
+            self.zoom_live_view_to_roi((left, top, width, height))
 
     def apply_roi_from_size(self):
         try:
             left, top, width, height = self._read_roi_size_fields()
-            self._set_roi_fields(left, top, width, height, update_live=True)
+            self._set_roi_fields(left, top, width, height, update_live=True, selected=True)
             self.log(f"ROI size applied: x={left}, y={top}, width={width}, height={height}. Press Apply Parameters to send it to Hera.")
             self._draw_live_view_placeholder()
         except Exception as exc:
@@ -4180,7 +4498,7 @@ class HeraTriggerApp(tk.Tk):
             top = min(y0, y1)
             width = abs(x1 - x0) + 1
             height = abs(y1 - y0) + 1
-            self._set_roi_fields(left, top, width, height, update_live=True)
+            self._set_roi_fields(left, top, width, height, update_live=True, selected=True)
             self.log(f"ROI corners applied from top-left and bottom-right: x={left}, y={top}, width={width}, height={height}. Press Apply Parameters to send it to Hera.")
             self._draw_live_view_placeholder()
         except Exception as exc:
@@ -4196,7 +4514,7 @@ class HeraTriggerApp(tk.Tk):
             new_height = max(1, int(math.ceil(area / new_width)))
             new_left = max(0, int(round(center_x - (new_width - 1) / 2.0)))
             new_top = max(0, int(round(center_y - (new_height - 1) / 2.0)))
-            self._set_roi_fields(new_left, new_top, new_width, new_height, update_live=True)
+            self._set_roi_fields(new_left, new_top, new_width, new_height, update_live=True, selected=True)
             self.log(f"ROI area applied as near-square region: area={area}, width={new_width}, height={new_height}. Press Apply Parameters to send it to Hera.")
             self._draw_live_view_placeholder()
         except Exception as exc:

@@ -26,12 +26,13 @@ The current implementation is focused on software-triggered acquisition and is s
 - graceful handling of read-only camera parameters
 - live-safe parameter apply that pauses live capture before changing gain, exposure, or ROI, then restarts it
 - live cursor readout that maps image pixels to sample/stage X/Y using a configurable pixel scale and axis orientation
-- live-view ROI workflow: click two corners on the live image, copy the ROI into camera parameter fields, then apply it safely
+- live-view ROI workflow: click two corners on the live image or edit ROI fields, then use that selected area for ROI export and hyperspectral display
 - live-view exposure helpers: auto-contrast display, red saturation overlay, and PNG snapshot export of the current displayed frame
 - adjustable three-pane interface with light/dark mode switching
 - editable ROI corners, ROI width/height, and ROI area helpers
 - asynchronous acquisition callback handling
-- hypercube generation with `HeraAPI_GetHyperCubeEx`
+- hypercube generation with `HeraAPI_GetHyperCubeEx`, plus ENVI post-export ROI cropping when the SDK returns a full-frame cube
+- HyperLAB shortcut support for opening the latest exported `.hdr` through Nireos HyperLAB
 - ENVI export to a user-selected output folder
 
 ## Project Files
@@ -127,17 +128,21 @@ Use the top-right `Light Mode` / `Dark Mode` button to switch the UI palette. Dr
 
 The Live View tab includes controls for choosing an ROI and judging exposure before a hyperspectral acquisition.
 
-- `Select ROI`: click two opposite corners on the live image. The app converts those clicks into image-pixel ROI values and fills the `ROI X`, `ROI Y`, `ROI W`, and `ROI H` parameter fields. Press `Apply Parameters` afterward to send the ROI to the camera. If live view is running, the app pauses live capture, applies the parameters, reads values back, and restarts live view.
+- `Select ROI`: click two opposite corners on the live image. The app converts those clicks into image-pixel ROI values and fills the `ROI X`, `ROI Y`, `ROI W`, and `ROI H` parameter fields. That selected ROI is kept separately from the camera ROI readback, because some Hera devices report ROI as read-only/full-frame during hyperspectral acquisition.
 - `Use Corners`: reads the top-left and bottom-right corner fields and updates the rectangular Hera ROI. The other two corners are recalculated from that rectangle.
 - `Use Size`: reads `ROI X`, `ROI Y`, `ROI Width`, and `ROI Height`, then refreshes the corner fields and ROI area.
 - `Set Area`: creates a near-square ROI with the requested pixel area, centered around the current ROI.
-- `Clear ROI`: resets the ROI fields to the full current live-frame size when a live frame is available.
+- `Clear ROI`: resets the ROI workflow to full-image export/display when a live frame is available.
 - `Auto Contrast`: display-only contrast stretching for the live preview. It helps make dim frames visible and does not change camera exposure, gain, or saved acquisition data.
 - `Show Saturation`: overlays saturated live-preview pixels in red using the saturation threshold returned by `HeraAPI_GetLiveCaptureInfo`.
 - `Gamma`: display-only brightness response control applied after auto-contrast. `1.0` is neutral; higher values brighten shadows and lower values darken the display. `Reset Gamma` returns it to `1.0`.
 - `Snapshot`: saves the latest live frame as a PNG. The file uses the current display choices, so auto-contrast and the red saturation overlay are included when enabled. It saves the live image content, not the canvas text labels or ROI outline.
 
 The saving panel includes a notes field. These notes are written into the ENVI export description when a hyperspectral cube is saved.
+
+When an ROI is selected, the SDK acquisition still runs through the normal full-frame hyperspectral path. The app then exports the full cube temporarily, crops the ENVI binary/header on disk to the selected ROI, and removes the temporary full-frame export. The Hyperspectral View uses the same selected ROI by cropping each displayed SDK band in memory, so the viewer and saved `.hdr`/data file match.
+
+The saving panel also includes a HyperLAB section. `Open Current` launches `C:\Users\Public\Desktop\Nireos HyperLAB.lnk` with the latest exported `.hdr` when Windows accepts the file argument; otherwise it opens HyperLAB and copies the `.hdr` path to the clipboard.
 
 ## NIS Z Bridge
 
