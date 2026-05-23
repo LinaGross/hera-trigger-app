@@ -2,6 +2,37 @@
 
 This repo controls a HERA camera/stage app and a separate NIS-Elements Z-axis bridge. Work carefully and keep GitHub as the source of truth.
 
+## Code Structure
+
+The app was refactored from a single 5,666-line file into a `hera_app/` package. `AppHeraTriggerPython0417.py` is now a 4-line launcher — do not edit it.
+
+All logic lives in:
+
+```
+hera_app/
+    app.py                        HeraTriggerApp class + __init__ + on_close + main()
+    controllers/
+        hera.py                   HeraDeviceInfo, HeraController (SDK DLL wrapper)
+        tango.py                  TangoController (stage DLL wrapper)
+        nis_z.py                  NISZBridgeController (file-bridge TCP wrapper)
+    mixins/
+        theme.py                  _configure_theme, _apply_theme_recursive, toggle_theme_mode
+        ui_builder.py             all _build_* UI construction methods
+        device.py                 connect/disconnect Hera + Tango, license, preflight, HDR
+        nis_z_mixin.py            NIS Z bridge polling and control
+        stage.py                  stage motion, position management, Z moves
+        export.py                 ENVI file helpers, tag sanitisation, ROI crop
+        flatfield.py              flatfield acquisition, normalization, clear
+        acquisition.py            parameter apply, arm/start acquisition, worker
+        timelapse.py              timelapse/cycle worker, site acquisition
+        live_view.py              live capture, rendering, zoom, pan, snapshots
+        roi.py                    ROI selection, overlays, cursor readout
+        hyperspectral_viewer.py   band viewer, spectrum panel
+        utils.py                  _safe_after, _log_async, _set_var_async
+```
+
+When making changes, open the relevant mixin file directly rather than the entry-point file. Use Ctrl+Shift+F to search across files if unsure where a method lives.
+
 ## Overall Goal
 
 Coordinate these files so the HERA PC and NIS PC can work together:
