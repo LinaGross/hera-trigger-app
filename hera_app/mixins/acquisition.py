@@ -239,6 +239,17 @@ class AcquisitionMixin:
         if self.save_pending_button:
             self.save_pending_button.config(state="disabled")
 
+        if acquisition_hdr_enabled:
+            try:
+                if self.controller.is_hdr_supported():
+                    self.controller.set_hdr(True)
+                    time.sleep(0.3)
+                    hdr_confirmed = self.controller.get_hdr()
+                    self.log(f"HDR re-asserted immediately before acquisition start: camera reports HDR={'on' if hdr_confirmed else 'off (camera reset it)'}")
+                    self._set_var_async(self.hdr_status_var, "HDR: on" if hdr_confirmed else "HDR: reset by camera")
+            except Exception as exc:
+                self.log(f"HDR re-assert before acquisition failed: {exc}")
+
         if trigger_mode_name == "Internal":
             if acquisition_role == "flatfield":
                 self.log("Sending software flatfield acquisition command through Hera SDK.")
