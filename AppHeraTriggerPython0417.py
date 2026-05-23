@@ -1254,6 +1254,7 @@ class HeraTriggerApp(tk.Tk):
         self.flatfield_info = None
         self.flatfield_status_var = tk.StringVar(value="Flatfield: none")
         self.use_flatfield_var = tk.BooleanVar(value=True)
+        self.flatfield_at_timelapse_start_var = tk.BooleanVar(value=False)
         self.pending_acquisition_role = "sample"
         self.pending_save_context = None
         self.pending_acquisition_auto_save = True
@@ -1338,6 +1339,9 @@ class HeraTriggerApp(tk.Tk):
         style.configure("Dark.Treeview.Heading", background=self.theme["panel_alt"], foreground=self.theme["text"], relief="flat")
         style.map("Dark.Treeview", background=[("selected", self.theme["accent"])], foreground=[("selected", "#111111")])
         style.configure("Dark.TSeparator", background=self.theme["border"])
+        style.configure("Left.TNotebook", background=self.theme["bg"], borderwidth=0)
+        style.configure("Left.TNotebook.Tab", background=self.theme["panel_alt"], foreground=self.theme["text"], padding=[12, 5], font=("Segoe UI", 10))
+        style.map("Left.TNotebook.Tab", background=[("selected", self.theme["accent"]), ("active", self.theme["panel"])], foreground=[("selected", self.theme["accent_text"])])
 
         self.option_add("*Font", "{Segoe UI} 10")
         self.option_add("*Background", self.theme["panel"])
@@ -1481,7 +1485,14 @@ class HeraTriggerApp(tk.Tk):
         self.roi_bl_y_var = tk.IntVar(value=511)
         self.roi_area_var = tk.StringVar(value=str(512 * 512))
 
-        status = tk.LabelFrame(parent, text="Status", padx=8, pady=8)
+        nb = ttk.Notebook(parent, style="Left.TNotebook")
+        nb.pack(fill="both", expand=True)
+        camera_tab = tk.Frame(nb, padx=4, pady=4)
+        stage_tab = tk.Frame(nb, padx=4, pady=4)
+        nb.add(camera_tab, text="  Camera  ")
+        nb.add(stage_tab, text="  Stage  ")
+
+        status = tk.LabelFrame(camera_tab, text="Status", padx=8, pady=8)
         status.pack(fill="x", pady=(0, 10))
         for text, var in (
             ("License", self.license_var),
@@ -1519,7 +1530,7 @@ class HeraTriggerApp(tk.Tk):
         tk.Button(btns, text="Live Status", command=self.debug_live_status).pack(side="left", padx=(0, 6))
         tk.Button(btns, text="Restart Live", command=self.restart_live_view).pack(side="left")
 
-        exposure = tk.LabelFrame(parent, text="Exposure", padx=8, pady=8)
+        exposure = tk.LabelFrame(camera_tab, text="Exposure", padx=8, pady=8)
         exposure.pack(fill="x", pady=(0, 10))
         exposure.grid_columnconfigure(1, weight=1)
         self._param_entry(exposure, 0, "Gain [dB]:", "gain", 0.0)
@@ -1527,7 +1538,7 @@ class HeraTriggerApp(tk.Tk):
         tk.Checkbutton(exposure, text="HDR", variable=self.hdr_enabled_var).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         tk.Button(exposure, text="Apply", command=self.apply_parameters_async).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
-        roi = tk.LabelFrame(parent, text="ROI", padx=8, pady=8)
+        roi = tk.LabelFrame(camera_tab, text="ROI", padx=8, pady=8)
         roi.pack(fill="x", pady=(0, 10))
         roi.grid_columnconfigure(1, weight=1)
         for _k, _v in [("roi_x", 0), ("roi_y", 0), ("roi_w", 512), ("roi_h", 512)]:
@@ -1559,7 +1570,7 @@ class HeraTriggerApp(tk.Tk):
         tk.Button(roi_actions, text="Clear", command=self.clear_live_roi_selection).pack(side="left")
         tk.Label(roi, textvariable=self.live_roi_status_var, fg=self.theme["muted"], wraplength=250, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-        xyz = tk.LabelFrame(parent, text="XYZ Position", padx=8, pady=8)
+        xyz = tk.LabelFrame(stage_tab, text="XYZ Position", padx=8, pady=8)
         xyz.pack(fill="x", pady=(0, 10))
         xyz.grid_columnconfigure(0, weight=1)
         self.stage_status_var = tk.StringVar(value="Stage: not connected")
@@ -1599,7 +1610,7 @@ class HeraTriggerApp(tk.Tk):
         ):
             tk.Button(position_panel, text=text, command=command).pack(fill="x", pady=2)
 
-        edit_panel = tk.LabelFrame(parent, text="Selected XYZ Site", padx=8, pady=8)
+        edit_panel = tk.LabelFrame(stage_tab, text="Selected XYZ Site", padx=8, pady=8)
         edit_panel.pack(fill="x", pady=(0, 10))
         tk.Entry(edit_panel, textvariable=self.selected_name_var, width=24).pack(fill="x", pady=(0, 6))
         tk.Button(edit_panel, text="Rename", command=self.rename_selected_position).pack(fill="x", pady=(0, 6))
@@ -1612,7 +1623,7 @@ class HeraTriggerApp(tk.Tk):
         tk.Button(edit_panel, text="Save Selected Edits", command=self.apply_selected_position_edits).pack(fill="x", pady=2)
         tk.Button(edit_panel, text="Go To Selected Position", command=self.goto_selected_position).pack(fill="x", pady=2)
 
-        saved = tk.LabelFrame(parent, text="Saved Positions", padx=8, pady=8)
+        saved = tk.LabelFrame(stage_tab, text="Saved Positions", padx=8, pady=8)
         saved.pack(fill="both", expand=True, pady=(0, 10))
         tree_wrap = tk.Frame(saved)
         tree_wrap.pack(fill="both", expand=True)
@@ -1631,7 +1642,7 @@ class HeraTriggerApp(tk.Tk):
         scroll.pack(side="right", fill="y")
         self.positions_tree.bind("<<TreeviewSelect>>", self.on_position_selected)
 
-        self._build_nis_z_ui(parent)
+        self._build_nis_z_ui(stage_tab)
 
     def _build_center_workspace(self, parent):
         spectral = tk.LabelFrame(parent, text="Control Bar", padx=8, pady=8)
@@ -1817,6 +1828,7 @@ class HeraTriggerApp(tk.Tk):
         tk.Label(flatfield, textvariable=self.flatfield_status_var, anchor="w", justify="left", wraplength=240).pack(fill="x", pady=(0, 6))
         tk.Button(flatfield, text="Acquire Baseline", command=self.start_flatfield_acquisition).pack(fill="x", pady=2)
         tk.Checkbutton(flatfield, text="Use flatfield correction", variable=self.use_flatfield_var).pack(anchor="w", pady=(4, 2))
+        tk.Checkbutton(flatfield, text="Acquire flatfield at timelapse start", variable=self.flatfield_at_timelapse_start_var).pack(anchor="w", pady=(2, 2))
         tk.Button(flatfield, text="Clear Flatfield", command=self.clear_flatfield).pack(fill="x", pady=2)
 
         saving = tk.LabelFrame(parent, text="Export", padx=8, pady=8)
@@ -3965,6 +3977,13 @@ class HeraTriggerApp(tk.Tk):
         cycle = 0
         interval_min = float(self.interval_var.get())
         try:
+            if self.flatfield_at_timelapse_start_var.get():
+                self._log_async("Acquiring flatfield baseline before timelapse start...")
+                tag = self._sanitize_export_tag(f"flatfield_{time.strftime('%Y%m%d_%H%M%S')}")
+                self._arm_and_start_acquisition(export_tag=tag, acquisition_role="flatfield")
+                self._await_acquisition_completion()
+                self._log_async("Flatfield baseline acquired and saved. Starting timelapse cycles.")
+
             while not self.timelapse_stop_event.is_set():
                 if self.timelapse_stop_at and datetime.now() >= self.timelapse_stop_at:
                     self._log_async("Reached requested stop time.")
@@ -4191,10 +4210,12 @@ class HeraTriggerApp(tk.Tk):
             self.current_hyper_band_cache = {}
             self.current_hyper_spectrum_cache = {}
             self.hyper_selected_pixel = None
+            released_as_flatfield = False
             if self.pending_acquisition_role == "flatfield":
                 if self.flatfield_hypercube_handle and self.flatfield_hypercube_handle != hypercube_handle:
                     try:
                         self.controller.release_hypercube(self.flatfield_hypercube_handle)
+                        released_as_flatfield = (self.flatfield_hypercube_handle == previous_handle)
                     except Exception:
                         pass
                 self.flatfield_hypercube_handle = hypercube_handle
@@ -4210,7 +4231,7 @@ class HeraTriggerApp(tk.Tk):
                 ),
             )
             self._log_async("Hyperspectral viewer is ready. Open the Hyperspectral View tab and move the band slider.")
-            if previous_handle:
+            if previous_handle and not released_as_flatfield:
                 if previous_handle != self.flatfield_hypercube_handle:
                     try:
                         self.controller.release_hypercube(previous_handle)
