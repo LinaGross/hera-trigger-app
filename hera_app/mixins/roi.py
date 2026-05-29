@@ -137,8 +137,14 @@ class ROIMixin:
         frame_width, frame_height = frame_size
         if frame_width <= 0 or frame_height <= 0:
             return None
-        canvas_x = left + (image_x + 0.5) * out_w / frame_width
-        canvas_y = top + (image_y + 0.5) * out_h / frame_height
+        display_x, display_y, display_width, display_height = self._raw_live_xy_to_display_xy(
+            image_x,
+            image_y,
+            frame_width,
+            frame_height,
+        )
+        canvas_x = left + (display_x + 0.5) * out_w / display_width
+        canvas_y = top + (display_y + 0.5) * out_h / display_height
         return canvas_x, canvas_y
 
     def _draw_live_roi_overlay(self, canvas):

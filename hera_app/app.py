@@ -156,6 +156,7 @@ class HeraTriggerApp(
         self.acquisition_requested_roi = None
         self.acquisition_requested_hdr = False
         self.live_max_preview_width = 480
+        self.live_display_rotation_degrees = 90
         self.live_auth_warning_logged = False
         self.last_live_decode_error = ""
         self.is_closing = False

@@ -317,8 +317,12 @@ class LiveViewMixin:
             with self.live_frame_lock:
                 frame = self.latest_live_frame
                 rect = self.live_display_rect
+                frame_size = self.live_display_frame_size
             if frame and rect:
-                src_width, src_height = frame[0], frame[1]
+                if frame_size:
+                    src_width, src_height = frame_size
+                else:
+                    src_width, src_height = frame[0], frame[1]
                 canvas = self.live_view_canvas
                 canvas_width = max(canvas.winfo_width(), 10)
                 canvas_height = max(canvas.winfo_height(), 10)
@@ -326,7 +330,8 @@ class LiveViewMixin:
                 if old_w > 0 and old_h > 0:
                     rel_x = (event.x - old_left) / old_w
                     rel_y = (event.y - old_top) / old_h
-                    base_w, base_h = self._fit_dimensions(src_width, src_height, max(canvas_width - 16, 1), max(canvas_height - 16, 1))
+                    display_src_width, display_src_height = self._live_display_dimensions(src_width, src_height)
+                    base_w, base_h = self._fit_dimensions(display_src_width, display_src_height, max(canvas_width - 16, 1), max(canvas_height - 16, 1))
                     new_w = max(1, int(round(base_w * new_zoom)))
                     new_h = max(1, int(round(base_h * new_zoom)))
                     centered_left = (canvas_width - new_w) / 2
@@ -499,6 +504,81 @@ class LiveViewMixin:
             dst_offset += dst_width
         return bytes(result)
 
+    def _get_live_display_rotation(self):
+        try:
+            rotation = int(getattr(self, "live_display_rotation_degrees", 0))
+        except Exception:
+            rotation = 0
+        return rotation % 360
+
+    def _live_display_dimensions(self, frame_width, frame_height):
+        rotation = self._get_live_display_rotation()
+        if rotation in (90, 270):
+            return frame_height, frame_width
+        return frame_width, frame_height
+
+    def _rotate_grayscale_clockwise(self, src_bytes, src_width, src_height):
+        expected_len = src_width * src_height
+        if not src_bytes or src_width <= 0 or src_height <= 0 or len(src_bytes) < expected_len:
+            return src_bytes
+        dst_width = src_height
+        dst = bytearray(expected_len)
+        for src_y in range(src_height):
+            src_row_start = src_y * src_width
+            dst_x = src_height - 1 - src_y
+            for src_x, value in enumerate(src_bytes[src_row_start:src_row_start + src_width]):
+                dst[src_x * dst_width + dst_x] = value
+        return bytes(dst)
+
+    def _rotate_grayscale_counterclockwise(self, src_bytes, src_width, src_height):
+        expected_len = src_width * src_height
+        if not src_bytes or src_width <= 0 or src_height <= 0 or len(src_bytes) < expected_len:
+            return src_bytes
+        dst_width = src_height
+        dst = bytearray(expected_len)
+        for src_y in range(src_height):
+            src_row_start = src_y * src_width
+            for src_x, value in enumerate(src_bytes[src_row_start:src_row_start + src_width]):
+                dst[(src_width - 1 - src_x) * dst_width + src_y] = value
+        return bytes(dst)
+
+    def _orient_live_display_bytes(self, gray_bytes, src_width, src_height, saturation_mask=None):
+        rotation = self._get_live_display_rotation()
+        if rotation == 90:
+            oriented_bytes = self._rotate_grayscale_clockwise(gray_bytes, src_width, src_height)
+            oriented_mask = self._rotate_grayscale_clockwise(saturation_mask, src_width, src_height) if saturation_mask else None
+            return oriented_bytes, src_height, src_width, oriented_mask
+        if rotation == 180:
+            oriented_bytes = bytes(reversed(gray_bytes)) if gray_bytes else gray_bytes
+            oriented_mask = bytes(reversed(saturation_mask)) if saturation_mask else None
+            return oriented_bytes, src_width, src_height, oriented_mask
+        if rotation == 270:
+            oriented_bytes = self._rotate_grayscale_counterclockwise(gray_bytes, src_width, src_height)
+            oriented_mask = self._rotate_grayscale_counterclockwise(saturation_mask, src_width, src_height) if saturation_mask else None
+            return oriented_bytes, src_height, src_width, oriented_mask
+        return gray_bytes, src_width, src_height, saturation_mask
+
+    def _raw_live_xy_to_display_xy(self, image_x, image_y, frame_width, frame_height):
+        rotation = self._get_live_display_rotation()
+        display_width, display_height = self._live_display_dimensions(frame_width, frame_height)
+        if rotation == 90:
+            return frame_height - 1 - image_y, image_x, display_width, display_height
+        if rotation == 180:
+            return frame_width - 1 - image_x, frame_height - 1 - image_y, display_width, display_height
+        if rotation == 270:
+            return image_y, frame_width - 1 - image_x, display_width, display_height
+        return image_x, image_y, display_width, display_height
+
+    def _display_live_xy_to_raw_xy(self, display_x, display_y, frame_width, frame_height):
+        rotation = self._get_live_display_rotation()
+        if rotation == 90:
+            return display_y, frame_height - 1 - display_x
+        if rotation == 180:
+            return frame_width - 1 - display_x, frame_height - 1 - display_y
+        if rotation == 270:
+            return frame_width - 1 - display_y, display_x
+        return display_x, display_y
+
     def _normalize_grayscale_for_display(self, gray_bytes):
         if not gray_bytes:
             return gray_bytes, 0, 0
@@ -628,6 +708,12 @@ class LiveViewMixin:
 
         render_bytes = self._prepare_live_display_bytes(gray_bytes)
         render_mask = saturation_mask if self.live_show_saturation_var.get() else None
+        render_bytes, display_width, display_height, render_mask = self._orient_live_display_bytes(
+            render_bytes,
+            src_width,
+            src_height,
+            render_mask,
+        )
 
         default_dir = self.param_vars.get("output_path").get() if "output_path" in self.param_vars else ""
         if not default_dir or not os.path.isdir(default_dir):
@@ -648,13 +734,13 @@ class LiveViewMixin:
         try:
             rgb_payload = self._grayscale_to_rgb_bytes(
                 render_bytes,
-                src_width,
-                src_height,
-                src_width,
-                src_height,
+                display_width,
+                display_height,
+                display_width,
+                display_height,
                 render_mask,
             )
-            self._write_rgb_png(snapshot_path, rgb_payload, src_width, src_height)
+            self._write_rgb_png(snapshot_path, rgb_payload, display_width, display_height)
         except Exception as exc:
             messagebox.showerror("Live Snapshot", f"Could not save snapshot:\n{exc}")
             self.log(f"Live snapshot failed: {exc}")
@@ -710,8 +796,14 @@ class LiveViewMixin:
         ox, oy = self._live_crop_offset
         image_x -= ox
         image_y -= oy
-        cx = left + (image_x + 0.5) * out_w / frame_width
-        cy = top + (image_y + 0.5) * out_h / frame_height
+        display_x, display_y, display_width, display_height = self._raw_live_xy_to_display_xy(
+            image_x,
+            image_y,
+            frame_width,
+            frame_height,
+        )
+        cx = left + (display_x + 0.5) * out_w / display_width
+        cy = top + (display_y + 0.5) * out_h / display_height
         if cx < left or cx > left + out_w or cy < top or cy > top + out_h:
             return
         color = "#46d66f"
@@ -842,19 +934,25 @@ class LiveViewMixin:
                 self._live_crop_offset = (0, 0)
             render_bytes = self._prepare_live_display_bytes(gray_bytes)
             render_mask = saturation_mask if self.live_show_saturation_var.get() else None
-            canvas = self.live_view_canvas
-            width = max(canvas.winfo_width(), 10)
-            height = max(canvas.winfo_height(), 10)
-            base_w, base_h = self._fit_dimensions(src_width, src_height, max(width - 16, 1), max(height - 16, 1))
-            target_w = max(1, int(round(base_w * self.live_zoom_factor)))
-            target_h = max(1, int(round(base_h * self.live_zoom_factor)))
-            self.live_photo, out_w, out_h = self._make_ppm_photo_from_grayscale(
+            display_bytes, display_src_width, display_src_height, display_mask = self._orient_live_display_bytes(
                 render_bytes,
                 src_width,
                 src_height,
+                render_mask,
+            )
+            canvas = self.live_view_canvas
+            width = max(canvas.winfo_width(), 10)
+            height = max(canvas.winfo_height(), 10)
+            base_w, base_h = self._fit_dimensions(display_src_width, display_src_height, max(width - 16, 1), max(height - 16, 1))
+            target_w = max(1, int(round(base_w * self.live_zoom_factor)))
+            target_h = max(1, int(round(base_h * self.live_zoom_factor)))
+            self.live_photo, out_w, out_h = self._make_ppm_photo_from_grayscale(
+                display_bytes,
+                display_src_width,
+                display_src_height,
                 target_w,
                 target_h,
-                render_mask,
+                display_mask,
             )
         except tk.TclError as exc:
             with self.live_frame_lock:
@@ -879,7 +977,7 @@ class LiveViewMixin:
         with self.live_frame_lock:
             self.live_display_rect = (left, top, out_w, out_h)
             self.live_display_frame_size = (frame_width, frame_height)
-        canvas.create_image(width / 2, height / 2, image=self.live_photo, anchor="center")
+        canvas.create_image(left + out_w / 2, top + out_h / 2, image=self.live_photo, anchor="center")
         if frame_info:
             w, h, bpp = frame_info
             canvas.create_text(
@@ -915,8 +1013,10 @@ class LiveViewMixin:
         if event.x < left or event.x >= left + out_w or event.y < top or event.y >= top + out_h:
             return None
 
-        image_x = min(max(int((event.x - left) * frame_width / out_w), 0), frame_width - 1)
-        image_y = min(max(int((event.y - top) * frame_height / out_h), 0), frame_height - 1)
+        display_width, display_height = self._live_display_dimensions(frame_width, frame_height)
+        display_x = min(max(int((event.x - left) * display_width / out_w), 0), display_width - 1)
+        display_y = min(max(int((event.y - top) * display_height / out_h), 0), display_height - 1)
+        image_x, image_y = self._display_live_xy_to_raw_xy(display_x, display_y, frame_width, frame_height)
         ox, oy = self._live_crop_offset
         return image_x + ox, image_y + oy, frame_width, frame_height
 

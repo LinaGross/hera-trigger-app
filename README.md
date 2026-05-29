@@ -132,7 +132,7 @@ python AppHeraTriggerPython0417.py
 
 ## Live View Cursor Coordinates
 
-The Live View tab shows cursor coordinates over the rendered camera frame. The app first maps the mouse location back to the live-frame pixel returned by `HeraAPI_GetLiveCaptureInfo`, then converts the pixel offset from the image center into a sample/stage X/Y estimate.
+The Live View tab shows cursor coordinates over the rendered camera frame. The preview is rotated 90 degrees clockwise so a Tango right move reads as rightward motion in the display. The app inverse-maps the mouse location, crosshair, ROI overlay, and ROI clicks back to the live-frame pixel returned by `HeraAPI_GetLiveCaptureInfo`, then converts the raw pixel offset from the image center into a sample/stage X/Y estimate.
 
 The **Stage Control > Live Cursor Sample Mapping** panel controls this conversion:
 
