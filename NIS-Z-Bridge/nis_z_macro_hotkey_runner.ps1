@@ -52,6 +52,7 @@ function Get-ResponsePathForCommand {
         "current_move_rel_custom" { return Join-Path $ResponseDir "current_move_rel_custom_response.txt" }
         "current_move_abs_4100_4050_7000" { return Join-Path $ResponseDir "current_move_abs_4100_4050_7000_response.txt" }
         "current_move_abs_4200_4000_8100" { return Join-Path $ResponseDir "current_move_abs_4200_4000_8100_response.txt" }
+        "current_move_abs_custom" { return Join-Path $ResponseDir "current_move_abs_custom_response.txt" }
         "current_stop" { return Join-Path $ResponseDir "current_stop_response.txt" }
         default { return $null }
     }

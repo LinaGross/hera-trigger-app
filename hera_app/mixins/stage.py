@@ -115,20 +115,33 @@ class StageMixin:
                 return candidate
             n += 1
 
+    def _is_auto_site_name(self, name):
+        text = str(name).strip().lower()
+        return text.startswith("site_") and text[5:].isdigit()
+
     def add_current_position(self):
         try:
             if not self.tango or not self.tango.connected:
                 raise RuntimeError("Connect the stage before saving positions.")
             x, y, _, _ = self.tango.get_position()
-            requested_name = self.position_name_var.get().strip() or self._next_site_name()
+            requested_name = self.selected_name_var.get().strip()
+            if not requested_name and hasattr(self, "position_name_var"):
+                requested_name = self.position_name_var.get().strip()
+            existing_names = {position.name for position in self.positions}
+            if requested_name in existing_names and self._is_auto_site_name(requested_name):
+                requested_name = self._next_site_name()
+            requested_name = requested_name or self._next_site_name()
             name = self._unique_position_name(requested_name)
             z, used_dummy_z = self._get_position_save_z()
-            self.positions.append(SavedPosition(name, x, y, z))
+            roi = self._capture_current_roi_for_position()
+            self.positions.append(SavedPosition(name, x, y, z, roi))
             self.selected_position_index = len(self.positions) - 1
             self._populate_selected_position_fields(self.positions[self.selected_position_index])
             self.refresh_positions_tree()
-            self.position_name_var.set("")
-            self.log(f"Added position {name} at X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}.")
+            self.log(
+                f"Added position {name} at X={x:.3f}, Y={y:.3f}, "
+                f"Z={self._format_saved_z(z) or '-'}, ROI={self._format_roi_short(roi)}."
+            )
             if used_dummy_z:
                 self.log(f"Used dummy Z={z:.3f} for {name} because NIS Z is not available yet.")
         except Exception as exc:
@@ -139,7 +152,18 @@ class StageMixin:
         for item in self.positions_tree.get_children():
             self.positions_tree.delete(item)
         for index, pos in enumerate(self.positions):
-            self.positions_tree.insert("", "end", iid=str(index), values=(pos.name, f"{pos.x:.3f}", f"{pos.y:.3f}", self._format_saved_z(pos.z)))
+            self.positions_tree.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    pos.name,
+                    f"{pos.x:.3f}",
+                    f"{pos.y:.3f}",
+                    self._format_saved_z(pos.z),
+                    "yes" if self._get_position_roi(pos) else "-",
+                ),
+            )
         if self.selected_position_index is None and self.positions:
             self.selected_position_index = 0
         if self.selected_position_index is not None and 0 <= self.selected_position_index < len(self.positions):
@@ -150,7 +174,8 @@ class StageMixin:
                 f"Selected position: {self.positions[self.selected_position_index].name}  |  "
                 f"X={self.positions[self.selected_position_index].x:.3f}  "
                 f"Y={self.positions[self.selected_position_index].y:.3f}  "
-                f"Z={self._format_saved_z(self.positions[self.selected_position_index].z) or '-'}"
+                f"Z={self._format_saved_z(self.positions[self.selected_position_index].z) or '-'}  "
+                f"ROI={self._format_roi_short(self._get_position_roi(self.positions[self.selected_position_index]))}"
             )
         else:
             self._clear_selected_position_fields()
@@ -162,7 +187,12 @@ class StageMixin:
             self.selected_position_index = int(selection[0])
             position = self.positions[self.selected_position_index]
             self._populate_selected_position_fields(position)
-            self.center_stage_summary_var.set(f"Selected position: {position.name}  |  X={position.x:.3f}  Y={position.y:.3f}  Z={self._format_saved_z(position.z) or '-'}")
+            self._apply_position_roi_to_ui(position)
+            self.center_stage_summary_var.set(
+                f"Selected position: {position.name}  |  X={position.x:.3f}  "
+                f"Y={position.y:.3f}  Z={self._format_saved_z(position.z) or '-'}  "
+                f"ROI={self._format_roi_short(self._get_position_roi(position))}"
+            )
         else:
             self.selected_position_index = None
             self._clear_selected_position_fields()
@@ -208,17 +238,25 @@ class StageMixin:
             x = float(self.selected_x_var.get())
             y = float(self.selected_y_var.get())
             z = self._parse_optional_z(self.selected_z_var.get())
+            roi = self._capture_current_roi_for_position()
             if self.selected_position_index is None:
-                self.positions.append(SavedPosition(name, x, y, z))
+                self.positions.append(SavedPosition(name, x, y, z, roi))
                 self.selected_position_index = len(self.positions) - 1
-                self.log(f"Added new position {name} at X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}.")
+                self.log(
+                    f"Added new position {name} at X={x:.3f}, Y={y:.3f}, "
+                    f"Z={self._format_saved_z(z) or '-'}, ROI={self._format_roi_short(roi)}."
+                )
             else:
                 position = self.positions[self.selected_position_index]
                 position.name = name
                 position.x = x
                 position.y = y
                 position.z = z
-                self.log(f"Saved edits for {name}: X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(z) or '-'}.")
+                position.roi = roi
+                self.log(
+                    f"Saved edits for {name}: X={x:.3f}, Y={y:.3f}, "
+                    f"Z={self._format_saved_z(z) or '-'}, ROI={self._format_roi_short(roi)}."
+                )
             self._populate_selected_position_fields(self.positions[self.selected_position_index])
             self.refresh_positions_tree()
         except Exception as exc:
@@ -239,9 +277,13 @@ class StageMixin:
             position.x = x
             position.y = y
             position.z, used_dummy_z = self._get_position_save_z()
+            position.roi = self._capture_current_roi_for_position()
             self._populate_selected_position_fields(position)
             self.refresh_positions_tree()
-            self.log(f"Updated {position.name} to X={x:.3f}, Y={y:.3f}, Z={self._format_saved_z(position.z) or '-'}.")
+            self.log(
+                f"Updated {position.name} to X={x:.3f}, Y={y:.3f}, "
+                f"Z={self._format_saved_z(position.z) or '-'}, ROI={self._format_roi_short(position.roi)}."
+            )
             if used_dummy_z:
                 self.log(f"Used dummy Z={position.z:.3f} for {position.name} because NIS Z is not available yet.")
         except Exception as exc:
@@ -316,6 +358,8 @@ class StageMixin:
         except Exception as exc:
             self.log(f"Manual site run failed: {exc}")
             self.update_state("Error")
+            return
+        if not self._validate_auto_save_export_options():
             return
 
         def worker():

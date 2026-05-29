@@ -25,16 +25,19 @@ The current implementation is focused on software-triggered acquisition and is s
 - scan mode and trigger mode support checks
 - graceful handling of read-only camera parameters
 - live-safe parameter apply that pauses live capture before changing gain, exposure, or ROI, then restarts it
-- live cursor readout that maps image pixels to sample/stage X/Y using a configurable pixel scale and axis orientation
-- live-view ROI workflow: click two corners on the live image or edit ROI fields, then use that selected area for ROI export and hyperspectral display
+- compact live cursor X/Y readout over the camera frame
+- live-view ROI workflow: click two corners on the live image or edit ROI fields, then use that selected area for acquisition, ROI export, and hyperspectral display
+- saved stage positions keep their own ROI, so manual site runs, `Run First 2 Sites`, and timelapse loops use the ROI saved with each site
 - live-view exposure helpers: auto-contrast display, red saturation overlay, crosshair row/column intensity plots, and PNG snapshot export of the current displayed frame
 - adjustable three-pane interface with light/dark mode switching
+- keyboard-friendly controls: focused buttons and checkboxes run on Enter, entries commit their related action on Enter or when you leave the field, and connected camera option changes auto-apply after a short debounce
+- always-on background logging with an `Open Log` button for the latest issue summary after a crash
 - editable ROI corners, ROI width/height, and ROI area helpers
 - asynchronous acquisition callback handling
 - hypercube generation with `HeraAPI_GetHyperCubeEx`, plus ENVI post-export ROI cropping when the SDK returns a full-frame cube
-- flatfield baseline acquisition with an explicit `Use flatfield correction` toggle; native ENVI export is always saved, and `_nrm` is added only when correction is enabled and compatible
-- HyperLAB shortcut support for opening the latest exported `.hdr` through Nireos HyperLAB
-- ENVI export to a user-selected output folder
+- persistent flatfield baseline acquisition; the Hyperspectral View can show `Normalized`, `Raw`, or `Flatfield`, and `_raw`/`_ref`/`_nrm` exports are controlled from the right-side Export panel
+- HyperLAB launch support that resolves the Nireos desktop shortcut to the installed `HyperLAB.exe` and opens the latest exported `.hdr`
+- ENVI export to a user-selected output folder, with headers patched to include the matching data file name for HyperLAB compatibility
 
 ## Project Files
 
@@ -126,21 +129,14 @@ python AppHeraTriggerPython0417.py
 2. Verify the SDK DLL path and `HERA_DEVICES`.
 3. Refresh devices and connect to the HERA camera.
 4. Run the preflight check.
-5. Apply acquisition parameters. If live view is running, the app temporarily stops live capture, applies gain/exposure/ROI, reads back actual values, and restarts live view.
-6. Start acquisition.
-7. Wait for the hypercube export to finish.
+5. Set an ROI if needed. Add or update a saved position after setting the ROI if that site should keep it.
+6. Edit acquisition parameters as needed. Entry fields commit on Enter or when you leave the field, and camera option changes auto-apply when connected. If live view is running, the app temporarily stops live capture, applies gain/exposure/ROI, reads back actual values, and restarts live view.
+7. Start a manual acquisition, run a selected site, run the first two sites, or start timelapse.
+8. Wait for the hypercube export to finish.
 
 ## Live View Cursor Coordinates
 
-The Live View tab shows cursor coordinates over the rendered camera frame. The app first maps the mouse location back to the live-frame pixel returned by `HeraAPI_GetLiveCaptureInfo`, then converts the pixel offset from the image center into a sample/stage X/Y estimate.
-
-The **Stage Control > Live Cursor Sample Mapping** panel controls this conversion:
-
-- `Stage units / pixel`: physical stage units represented by one live-image pixel.
-- `Invert X` and `Invert Y`: flip the image-to-stage direction for either axis.
-- `Swap XY`: swap image X/Y before applying the stage conversion.
-
-The conversion assumes the current Tango stage X/Y corresponds to the center of the live frame. If the stage moves while the mouse stays over the same live pixel, the displayed sample X/Y updates with the latest stage position.
+The Live View tab shows the cursor X/Y over the rendered camera frame. The preview is rotated 90 degrees clockwise so a Tango right move reads as rightward motion in the display. The app inverse-maps the mouse location, crosshair, ROI overlay, and ROI clicks back to the live-frame pixels returned by `HeraAPI_GetLiveCaptureInfo`; there are no pixel-scale, invert-axis, or swap-axis controls in the stage panel.
 
 ## Interface Layout
 
@@ -152,11 +148,18 @@ The app uses a resizable three-pane layout:
 
 Use the top-right `Light Mode` / `Dark Mode` button to switch the UI palette. Drag the vertical pane dividers to resize the left, center, and right areas.
 
+Most controls activate without needing a separate Apply step. Buttons and checkboxes take focus when clicked and can be run again with Enter. Entry fields commit their matching action on Enter or when you leave the field, for example exposure/gain applies camera parameters, ROI fields apply ROI, stage speed applies motion settings, selected site edits are saved, and the hyperspectral band entry jumps to that band.
+
+## Background Logs
+
+The app writes a full background log to `hera_app\output\hera_background_status.log` and a shorter crash/issue summary to `hera_app\output\hera_last_issues.log`. Use `Open Log` in the Status / Messages bar to open the short summary. The summary includes recent failures, current site/cycle/export state, a tail of recent messages, and unhandled Python/Tk/thread tracebacks when available.
+
 ## Live View ROI And Exposure Checks
 
 The Live View tab includes controls for choosing an ROI and judging exposure before a hyperspectral acquisition.
 
 - `Select ROI`: click two opposite corners on the live image. The app converts those clicks into image-pixel ROI values and fills the `ROI X`, `ROI Y`, `ROI W`, and `ROI H` parameter fields. That selected ROI is kept separately from the camera ROI readback, because some Hera devices report ROI as read-only/full-frame during hyperspectral acquisition.
+- Saved positions store the active ROI at the time you press `Add Current Position`, `Update Selected Position`, or `Save Selected Edits`. Selecting a saved position restores its ROI into the ROI controls. Manual site runs, `Run First 2 Sites`, and timelapse use the saved ROI for each site; sites without a saved ROI use the current timelapse-start ROI as a fallback, otherwise full frame.
 - `Use Corners`: reads the top-left and bottom-right corner fields and updates the rectangular Hera ROI. The other two corners are recalculated from that rectangle.
 - `Use Size`: reads `ROI X`, `ROI Y`, `ROI Width`, and `ROI Height`, then refreshes the corner fields and ROI area.
 - `Set Area`: creates a near-square ROI with the requested pixel area, centered around the current ROI.
@@ -169,19 +172,25 @@ The Live View tab includes controls for choosing an ROI and judging exposure bef
 
 The `Live View HDR` checkbox controls the camera HDR mode used by live preview. On the tested Hera Kinetix MC setup, the SDK accepts HDR for live frames (`Mono16`, HDR on), but hyperspectral data and hypercubes still report `HDR=off` through `HeraAPI_GetHyperspectralDataIsHDR` and `HeraAPI_GetHyperCubeIsHDR`. The app logs that downgrade and writes the actual hyperspectral HDR flag into the ENVI description, so saved cubes are not mislabeled as HDR.
 
-The saving panel includes a notes field. These notes are written into the ENVI export description when a hyperspectral cube is saved.
+The saving panel includes the output folder, optional export name/stamp, `_raw`/`_ref`/`_nrm` checkboxes, and a notes field. These settings control manual exports and auto-saved site/timelapse acquisitions; auto-saved runs check that at least one requested export product is possible before starting.
 
-When an ROI is selected, the SDK acquisition still runs through the normal full-frame hyperspectral path. The app then exports the full cube temporarily, crops the ENVI binary/header on disk to the selected ROI, and removes the temporary full-frame export. The Hyperspectral View uses the same selected ROI by cropping each displayed SDK band in memory, so the viewer and saved `.hdr`/data file match.
+When an ROI is selected, the SDK acquisition may still run through the normal full-frame hyperspectral path. The app then exports the full cube temporarily, maps the saved live-frame ROI into the returned hypercube dimensions, crops the ENVI binary/header on disk to that ROI, and removes the temporary full-frame export. The Hyperspectral View uses the same scaled ROI by cropping each displayed SDK band in memory, so the viewer and saved `.hdr`/data file match.
 
 ## Flatfield
 
-The Flatfield panel follows the original Hera Acquisition App concept: acquire a white diffusive surface as a baseline/reference, then optionally use it to normalize later sample measurements. `Acquire Baseline` runs a normal Hera acquisition and stores the resulting hypercube as the flatfield reference. `Clear Flatfield` removes it.
+The Flatfield controls follow the original Hera Acquisition App concept: acquire a white diffusive surface as a baseline/reference, then use it to normalize later sample measurements. `Acquire` runs a normal Hera acquisition and stores the resulting hypercube as the flatfield reference. `Clear` removes it. The reference stays active until you acquire a new flatfield or clear it.
 
-The `Use flatfield correction` checkbox controls whether later sample cubes use the stored baseline. Native ENVI export is always written first, with or without the checkbox. When the checkbox is enabled and the later sample cube has matching source size, displayed ROI, band count, and data type, the app also exports an additional `_nrm` ENVI cube where each sample pixel is divided by the matching flatfield pixel. The Hyperspectral View displays normalized bands only when this checkbox is enabled and the flatfield is compatible; otherwise it displays the native cube.
+The Hyperspectral View `Show` menu has `Normalized`, `Raw`, and `Flatfield` modes. `Normalized` displays the current sample divided by the stored matching flatfield; `Raw` displays the native sample cube; `Flatfield` displays the stored reference cube. The right-side Export panel controls saved products: `_raw` writes the sample cube, `_ref` writes the matching flatfield reference, and `_nrm` writes a normalized cube where each sample pixel is divided by the matching flatfield pixel. `_ref` and `_nrm` are skipped when no compatible flatfield is loaded. After acquiring a flatfield, the same `Export` button saves it as `_ref` using the shared folder/name/stamp controls.
 
-The saving panel also includes a HyperLAB section. `Open in HyperLAB` launches `C:\Users\Public\Desktop\Nireos HyperLAB.lnk` with the latest native exported `.hdr` when Windows accepts the file argument; otherwise it opens HyperLAB and copies the `.hdr` path to the clipboard.
+The saving panel also includes a HyperLAB action. `Open in HyperLAB` resolves `C:\Users\Public\Desktop\Nireos HyperLAB.lnk` to the installed `HyperLAB.exe`, then starts HyperLAB with the current exported `.hdr`. If the app was restarted and no in-memory export path is available, it searches the output folder for the newest `_raw`, `_ref`, or `_nrm` header and uses that. The path is also copied to the clipboard.
 
-## Saved Positions And Dummy Z
+Exports are ENVI header/data-file pairs. The SDK may write the binary data file without an extension, so the app patches each header with `file type = ENVI Standard` and `data file = ...` after export or ROI crop. Keep the `.hdr` and matching data file together when moving a measurement folder.
+
+## Saved Positions, ROI, And Dummy Z
+
+The saved positions table starts empty. There is no automatic `Start`/`0,0` site; add the first site from the current stage position before running a site, the first-two-sites check, or a timelapse.
+
+Saved XYZ positions also store the active ROI. Set or select the ROI first, then add or update the position. The saved positions table shows whether each site has an ROI, and selecting a site restores its saved ROI into the controls.
 
 Saved XYZ positions no longer depend on a successful NIS Z bridge read. If a cached real Z value is available it is used; otherwise the app saves `Z=0.000` as a dummy placeholder so XY site saving remains usable while Z integration is being debugged.
 

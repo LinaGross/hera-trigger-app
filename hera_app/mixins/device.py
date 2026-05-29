@@ -15,8 +15,11 @@ class DeviceMixin:
             self.log(f"Hera auto-connect skipped: {exc}")
 
         try:
-            if os.path.exists(self.tango_dll_var.get()):
+            tango_dll_path = self.tango_dll_var.get()
+            if os.path.exists(tango_dll_path):
                 self.connect_stage()
+            else:
+                self.log(f"Tango auto-connect skipped: DLL not found at {tango_dll_path}")
         except Exception as exc:
             self.log(f"Tango auto-connect skipped: {exc}")
 
@@ -245,14 +248,14 @@ class DeviceMixin:
             if not self.controller.is_hdr_supported():
                 self.hdr_enabled_var.set(False)
                 self.hdr_status_var.set("HDR: not supported")
-                self.log("HDR mode is not supported by this Hera device or SDK DLL.")
+                self.log("HDR mode is not supported by this Hera device or SDK DLL.", detail=True)
                 return False
             actual_hdr = self.controller.get_hdr()
             self.hdr_enabled_var.set(actual_hdr)
             self.hdr_status_var.set("HDR: on" if actual_hdr else "HDR: off")
-            self.log(f"HDR mode supported. Current camera HDR mode: {'on' if actual_hdr else 'off'}.")
+            self.log(f"HDR mode supported. Current camera HDR mode: {'on' if actual_hdr else 'off'}.", detail=True)
             return True
         except Exception as exc:
             self.hdr_status_var.set("HDR: check failed")
-            self.log(f"Could not read HDR support/status: {exc}")
+            self.log(f"Could not read HDR support/status: {exc}", detail=True)
             return False

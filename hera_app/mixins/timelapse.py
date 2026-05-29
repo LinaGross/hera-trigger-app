@@ -7,6 +7,22 @@ from datetime import datetime, timedelta
 
 
 class TimelapseMixin:
+    def _roi_plan_message(self, label, positions):
+        positions = list(positions)
+        saved_count = sum(1 for position in positions if self._get_position_roi(position))
+        total = len(positions)
+        fallback_roi = self._normalize_roi_tuple(self.timelapse_roi)
+        if saved_count and fallback_roi:
+            return (
+                f"{label}. Using saved ROI for {saved_count}/{total} site(s); "
+                f"current ROI fallback for sites without saved ROI: {self._format_roi(fallback_roi)}."
+            )
+        if saved_count:
+            return f"{label}. Using saved ROI for {saved_count}/{total} site(s); sites without ROI acquire full frame."
+        if fallback_roi:
+            return f"{label}. No per-site ROI saved; using current ROI for all sites: {self._format_roi(fallback_roi)}."
+        return f"{label}. No ROI active; all sites will acquire the full frame."
+
     def run_one_cycle(self):
         if self.timelapse_thread and self.timelapse_thread.is_alive():
             self.log("Timelapse is already running.")
@@ -14,23 +30,59 @@ class TimelapseMixin:
         if not self.positions:
             self.log("Add at least one stage position before running a cycle.")
             return
+        if not self._validate_auto_save_export_options():
+            return
 
         self.timelapse_stop_event.clear()
         self.timelapse_pause_event.clear()
         self.trigger_log = []
         self.timelapse_started_at = datetime.now()
         self.timelapse_stop_at = None
-        self.timelapse_roi = self.selected_export_roi if self.roi_selection_active else None
+        self.timelapse_roi = self._get_active_roi()
         self.pause_button.config(text="Pause")
         self.timelapse_status_var.set("Timelapse: running")
         self.update_state("RunningTimelapse")
 
         self.timelapse_thread = threading.Thread(target=self._timelapse_worker, args=(True,), daemon=True)
         self.timelapse_thread.start()
-        if self.timelapse_roi:
-            self.log(f"Running one cycle. ROI active for all sites: {self.timelapse_roi}.")
-        else:
-            self.log("Running one cycle. No ROI active; all sites will acquire the full frame.")
+        self.log(self._roi_plan_message("Running one cycle", self.positions))
+        self.log(f"Auto-save products: {self._export_selection_text()}.")
+
+    def _first_two_test_sites(self):
+        positions = list(self.positions)
+        real_sites = [position for position in positions if position.name.strip().lower() != "start"]
+        return (real_sites or positions)[:2]
+
+    def run_first_two_sites(self):
+        if self.timelapse_thread and self.timelapse_thread.is_alive():
+            self.log("Timelapse is already running.")
+            return
+        test_sites = self._first_two_test_sites()
+        if not test_sites:
+            self.log("Add at least one stage position before running a two-site test.")
+            return
+        if not self._validate_auto_save_export_options():
+            return
+
+        self.timelapse_stop_event.clear()
+        self.timelapse_pause_event.clear()
+        self.trigger_log = []
+        self.timelapse_started_at = datetime.now()
+        self.timelapse_stop_at = None
+        self.timelapse_roi = self._get_active_roi()
+        self.pause_button.config(text="Pause")
+        self.timelapse_status_var.set("Timelapse: running")
+        self.update_state("RunningTimelapse")
+
+        self.timelapse_thread = threading.Thread(
+            target=self._timelapse_worker,
+            args=(True, test_sites),
+            daemon=True,
+        )
+        self.timelapse_thread.start()
+        site_names = ", ".join(position.name for position in test_sites)
+        self.log(self._roi_plan_message(f"Running first {len(test_sites)} site(s): {site_names}", test_sites))
+        self.log(f"Auto-save products: {self._export_selection_text()}.")
 
     def start_timelapse(self):
         if self.timelapse_thread and self.timelapse_thread.is_alive():
@@ -44,6 +96,8 @@ class TimelapseMixin:
         if interval_min <= 0:
             self.log("Interval must be greater than zero.")
             return
+        if not self._validate_auto_save_export_options():
+            return
 
         self.timelapse_stop_event.clear()
         self.timelapse_pause_event.clear()
@@ -51,17 +105,15 @@ class TimelapseMixin:
         self.timelapse_started_at = datetime.now()
         stop_after = float(self.stop_after_var.get())
         self.timelapse_stop_at = self.timelapse_started_at + timedelta(minutes=stop_after) if stop_after > 0 else None
-        self.timelapse_roi = self.selected_export_roi if self.roi_selection_active else None
+        self.timelapse_roi = self._get_active_roi()
         self.pause_button.config(text="Pause")
         self.timelapse_status_var.set("Timelapse: running")
         self.update_state("RunningTimelapse")
 
         self.timelapse_thread = threading.Thread(target=self._timelapse_worker, args=(False,), daemon=True)
         self.timelapse_thread.start()
-        if self.timelapse_roi:
-            self.log(f"Timelapse started. ROI active for all sites: {self.timelapse_roi}.")
-        else:
-            self.log("Timelapse started. No ROI active; all sites will acquire the full frame.")
+        self.log(self._roi_plan_message("Timelapse started", self.positions))
+        self.log(f"Auto-save products: {self._export_selection_text()}.")
 
     def pause_or_resume_timelapse(self):
         if not self.timelapse_thread or not self.timelapse_thread.is_alive():
@@ -88,17 +140,11 @@ class TimelapseMixin:
         self.timelapse_status_var.set("Timelapse: stopping")
         self.log("Timelapse stop requested.")
 
-    def _timelapse_worker(self, single_cycle=False):
+    def _timelapse_worker(self, single_cycle=False, positions_override=None):
         cycle = 0
         interval_min = float(self.interval_var.get())
+        positions = list(positions_override) if positions_override is not None else list(self.positions)
         try:
-            if self.flatfield_at_timelapse_start_var.get():
-                self._log_async("Acquiring flatfield baseline before timelapse start...")
-                tag = self._sanitize_export_tag(f"flatfield_{time.strftime('%Y%m%d_%H%M%S')}")
-                self._arm_and_start_acquisition(export_tag=tag, acquisition_role="flatfield")
-                self._await_acquisition_completion()
-                self._log_async("Flatfield baseline acquired and saved. Starting timelapse cycles.")
-
             while not self.timelapse_stop_event.is_set():
                 if self.timelapse_stop_at and datetime.now() >= self.timelapse_stop_at:
                     self._log_async("Reached requested stop time.")
@@ -108,7 +154,7 @@ class TimelapseMixin:
                 cycle += 1
                 self._set_var_async(self.current_cycle_var, f"Cycle: {cycle}")
                 self._log_async(f"Cycle {cycle} started.")
-                for position in list(self.positions):
+                for position in positions:
                     if self.timelapse_stop_event.is_set():
                         break
                     self._wait_while_paused()
@@ -127,6 +173,7 @@ class TimelapseMixin:
                             "ZStatus": z_status,
                             "Timestamp": datetime.now().isoformat(timespec="seconds"),
                             "ExportPath": export_path,
+                            "ROI": self._format_roi_short(self._get_position_roi(position) or self.timelapse_roi),
                             "Status": "confirmed",
                         }
                     )
@@ -135,7 +182,7 @@ class TimelapseMixin:
                 if self.timelapse_stop_event.is_set():
                     break
                 if single_cycle:
-                    self._log_async("Single cycle complete.")
+                    self._log_async("Test run complete." if positions_override is not None else "Single cycle complete.")
                     break
                 if self.timelapse_stop_at and datetime.now() >= self.timelapse_stop_at:
                     self._log_async("Reached requested stop time.")
@@ -177,7 +224,7 @@ class TimelapseMixin:
         os.makedirs(output_dir, exist_ok=True)
         log_path = os.path.join(output_dir, f"hera_tango_trigger_log_{time.strftime('%Y%m%d_%H%M%S')}.csv")
         with open(log_path, "w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=["Cycle", "Site", "X", "Y", "Z", "ZStatus", "Timestamp", "ExportPath", "Status"])
+            writer = csv.DictWriter(csv_file, fieldnames=["Cycle", "Site", "X", "Y", "Z", "ZStatus", "Timestamp", "ExportPath", "ROI", "Status"])
             writer.writeheader()
             writer.writerows(self.trigger_log)
         self._log_async(f"Trigger log saved: {log_path}")
@@ -193,6 +240,19 @@ class TimelapseMixin:
             self.time_remaining_var.set(f"Time remaining: {seconds / 60:.2f} min")
         elif not (self.timelapse_thread and self.timelapse_thread.is_alive()):
             self.time_remaining_var.set("Time remaining: -")
+
+    def _timelapse_site_z_target(self, position):
+        try:
+            target_z = float(position.z)
+        except (TypeError, ValueError):
+            return None, "no Z"
+        if math.isnan(target_z):
+            return None, "no Z"
+        if self.nis_z is None or self.nis_z_last_value is None:
+            return None, "Z skipped: bridge not ready"
+        if str(self.nis_z_last_status).lower() != "ok":
+            return None, f"Z skipped: {self.nis_z_last_status}"
+        return target_z, "pending"
 
     def run_stage_site_acquisition(self, position, cycle_index=None):
         with self.stage_lock:
@@ -213,20 +273,23 @@ class TimelapseMixin:
         # Move Z after XY is settled. Skip if NIS Z bridge is not active.
         confirmed_z = None
         z_status = "no Z"
-        if self.nis_z is not None:
-            try:
-                target_z = float(position.z)
-                if not math.isnan(target_z):
-                    self._log_async(f"NIS Z: targeting {target_z:.3f} um for {position.name}...")
-                    confirmed_z, z_status = self._move_z_to_position(target_z)
-            except (TypeError, ValueError):
-                pass
+        target_z, z_status = self._timelapse_site_z_target(position)
+        if target_z is not None:
+            self._log_async(f"NIS Z: targeting {target_z:.3f} um for {position.name}...")
+            confirmed_z, z_status = self._move_z_to_position(target_z)
+        elif z_status != "no Z":
+            self._log_async(f"{z_status} for {position.name}; starting Hera acquisition without Z move.")
 
         self.log(f"Starting Hera acquisition at {position.name}.")
         if cycle_index is None:
             export_tag = self._sanitize_export_tag(f"{position.name}_{time.strftime('%Y%m%d_%H%M%S')}")
         else:
             export_tag = self._sanitize_export_tag(f"{position.name}_{cycle_index:03d}")
-        self._arm_and_start_acquisition(export_tag=export_tag, forced_roi=self.timelapse_roi)
+        site_roi = self._get_position_roi(position) or self.timelapse_roi
+        if site_roi:
+            self.log(f"Using ROI for {position.name}: {self._format_roi(site_roi)}.")
+        else:
+            self.log(f"No ROI saved for {position.name}; acquiring full frame.")
+        self._arm_and_start_acquisition(export_tag=export_tag, forced_roi=site_roi)
         export_path = self._await_acquisition_completion()
         return export_path, confirmed_z, z_status

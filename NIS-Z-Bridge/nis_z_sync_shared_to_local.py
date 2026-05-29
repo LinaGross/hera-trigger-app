@@ -41,6 +41,23 @@ COMMAND_SLOT_MAP = {
     "STOP": "current_stop",
 }
 
+_MOVE_REL_RE = re.compile(r"^MOVE_REL\s+([-+]?\d+(?:\.\d+)?)$")
+_MOVE_ABS_RE = re.compile(r"^MOVE_ABS\s+([-+]?\d+(?:\.\d+)?)(?:\s+[-+]?\d+(?:\.\d+)?\s+[-+]?\d+(?:\.\d+)?)?$")
+
+
+def _resolve_command(command_text: str) -> "tuple[str, str] | None":
+    """Return (slot_name, local_file_content) for a command, or None if unsupported."""
+    if command_text in COMMAND_SLOT_MAP:
+        return COMMAND_SLOT_MAP[command_text], command_text + "\n"
+    m = _MOVE_REL_RE.match(command_text)
+    if m:
+        return "current_move_rel_custom", m.group(1) + "\n"
+    m = _MOVE_ABS_RE.match(command_text)
+    if m:
+        return "current_move_abs_custom", m.group(1) + "\n"
+    return None
+
+
 RESPONSE_SLOT_MAP = {
     "current_getz_response.txt": "current_getz",
     "current_move_rel_p1_response.txt": "current_move_rel_p1",
@@ -48,6 +65,8 @@ RESPONSE_SLOT_MAP = {
     "current_move_abs_4100_4050_7000_response.txt": "current_move_abs_4100_4050_7000",
     "current_move_abs_4200_4000_8100_response.txt": "current_move_abs_4200_4000_8100",
     "current_stop_response.txt": "current_stop",
+    "current_move_rel_custom_response.txt": "current_move_rel_custom",
+    "current_move_abs_custom_response.txt": "current_move_abs_custom",
 }
 SLOT_RESPONSE_MAP = {slot_name: response_name for response_name, slot_name in RESPONSE_SLOT_MAP.items()}
 
@@ -243,13 +262,16 @@ def forward_shared_commands() -> int:
 
         try:
             command_text = shared_command.read_text(encoding="ascii").strip()
-            slot_name = COMMAND_SLOT_MAP[command_text]
-        except KeyError:
-            logging.error("Unsupported shared command text: %s", shared_command)
-            continue
+            resolved = _resolve_command(command_text)
         except Exception as exc:
             logging.exception("Failed to parse shared command %s: %s", shared_command, exc)
             continue
+
+        if resolved is None:
+            logging.error("Unsupported shared command text in %s: %r", shared_command, command_text)
+            continue
+
+        slot_name, file_content = resolved
 
         local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
         slot_state = state_file_for_slot(slot_name)
@@ -268,7 +290,7 @@ def forward_shared_commands() -> int:
                 logging.warning("Could not clear stale processed command %s: %s", processed_command, exc)
 
         try:
-            write_text_file(local_command, command_text + "\n")
+            write_text_file(local_command, file_content)
             write_text_file(slot_state, shared_command.stem + "\n")
             shared_command.replace(archived_command)
             logging.info(

@@ -113,7 +113,7 @@ class NISZMixin:
 
             def worker():
                 try:
-                    z = self._get_nis_z_controller().get_z(timeout_sec=3)
+                    z = self._get_nis_z_controller().get_z(timeout_sec=15)
                     self._safe_after(0, lambda: self._set_nis_z_value(z))
                 except Exception as exc:
                     self._safe_after(0, lambda exc=exc: self._set_nis_z_status(str(exc)))

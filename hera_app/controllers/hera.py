@@ -11,6 +11,7 @@ class SavedPosition:
     x: float
     y: float
     z: float = math.nan
+    roi: tuple = None
 
 
 class HeraDeviceInfo(ctypes.Structure):
@@ -49,10 +50,16 @@ class HeraController:
     @staticmethod
     def default_dll_path():
         base = os.path.abspath(os.path.dirname(__file__))
-        candidate = os.path.join(base, "HeraAPI.dll")
+        # Also search the project root (two levels up from hera_app/controllers/)
+        project_root = os.path.abspath(os.path.join(base, "..", ".."))
+        for search_dir in (base, project_root):
+            candidate = os.path.join(search_dir, "HeraAPI.dll")
+            if os.path.exists(candidate):
+                return candidate
+        candidate = os.path.join(base, "HeraNetAPI.dll")
         if os.path.exists(candidate):
             return candidate
-        return os.path.join(base, "HeraNetAPI.dll")
+        return os.path.join(project_root, "HeraNetAPI.dll")
 
     @staticmethod
     def get_hera_devices_path():
@@ -734,6 +741,48 @@ class HeraController:
         else:
             values = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_double))
         return wavelength.value, [float(values[index]) for index in range(sample_count)]
+
+    def get_hypercube_band_pixel_value(self, hypercube_handle, band_index, pixel_index, data_type):
+        wavelength = ctypes.c_double()
+        data_ptr = ctypes.c_void_p()
+        self.check_status(
+            self.HeraAPI_GetHyperCubeBandData(
+                hypercube_handle,
+                ctypes.c_uint(band_index),
+                ctypes.byref(wavelength),
+                ctypes.byref(data_ptr),
+            ),
+            "Get hypercube band data",
+        )
+        if not data_ptr.value:
+            raise RuntimeError("Hypercube band data pointer was null.")
+        if pixel_index < 0:
+            raise RuntimeError(f"Invalid hypercube pixel index {pixel_index}.")
+        if data_type == 0:
+            values = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_float))
+        else:
+            values = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_double))
+        return wavelength.value, float(values[pixel_index])
+
+    def get_hypercube_band_pointer(self, hypercube_handle, band_index, data_type):
+        wavelength = ctypes.c_double()
+        data_ptr = ctypes.c_void_p()
+        self.check_status(
+            self.HeraAPI_GetHyperCubeBandData(
+                hypercube_handle,
+                ctypes.c_uint(band_index),
+                ctypes.byref(wavelength),
+                ctypes.byref(data_ptr),
+            ),
+            "Get hypercube band data pointer",
+        )
+        if not data_ptr.value:
+            raise RuntimeError("Hypercube band data pointer was null.")
+        if data_type == 0:
+            values = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_float))
+        else:
+            values = ctypes.cast(data_ptr, ctypes.POINTER(ctypes.c_double))
+        return wavelength.value, values
 
     def export_hypercube_envi(self, hypercube_handle, output_path, description=None):
         desc_bytes = description.encode("utf-8") if description else None

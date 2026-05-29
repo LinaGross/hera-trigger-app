@@ -1,12 +1,14 @@
 import ctypes
-import math
 import msvcrt
 import os
+import sys
 import tempfile
 import threading
 import tkinter as tk
+import traceback
+from datetime import datetime
 
-from hera_app.controllers import HeraController, NISZBridgeController, SavedPosition
+from hera_app.controllers import HeraController, NISZBridgeController
 from hera_app.mixins.acquisition import AcquisitionMixin
 from hera_app.mixins.device import DeviceMixin
 from hera_app.mixins.export import ExportMixin
@@ -64,25 +66,37 @@ class HeraTriggerApp(
         4: "Mono16",
     }
 
+    @staticmethod
+    def default_tango_dll_path():
+        base = os.path.abspath(os.path.dirname(__file__))
+        project_root = os.path.abspath(os.path.join(base, ".."))
+        for search_dir in (base, project_root):
+            candidate = os.path.join(search_dir, "Tango_DLL.dll")
+            if os.path.exists(candidate):
+                return candidate
+        return os.path.join(project_root, "Tango_DLL.dll")
+
     def __init__(self):
         super().__init__()
         self.title("Hera + Tango Trigger Control")
-        self.geometry("1480x980")
-        self.minsize(1360, 900)
+        self.geometry("1400x900")
+        self.minsize(1240, 800)
         self.theme_mode = "dark"
         self.theme_button_var = tk.StringVar(value="Light Mode")
 
         self.controller = None
         self.tango = None
         self.devices = []
-        self.positions = [SavedPosition("Start", 0.0, 0.0, math.nan)]
+        self.positions = []
         self.selected_position_index = None
         self.processing_lock = threading.Lock()
         self.stage_lock = threading.Lock()
         self.live_frame_lock = threading.Lock()
+        self.hypercube_read_lock = threading.Lock()
         self.parameter_apply_lock = threading.Lock()
         self.app_state = self.STATE_LABELS["Idle"]
         self.stage_poll_job = None
+        self._auto_apply_parameters_job = None
         self.timelapse_thread = None
         self.timelapse_stop_event = threading.Event()
         self.timelapse_pause_event = threading.Event()
@@ -97,7 +111,7 @@ class HeraTriggerApp(
         self.license_var = tk.StringVar(value="Unknown")
         self.license_ok_seen = False
         self.selected_device_var = tk.StringVar(value="(none)")
-        self.tango_dll_var = tk.StringVar(value=os.path.join(os.path.abspath(os.path.dirname(__file__)), "Tango_DLL.dll"))
+        self.tango_dll_var = tk.StringVar(value=self.default_tango_dll_path())
         self.stage_port_var = tk.StringVar(value="COM7")
         self.stage_baud_var = tk.IntVar(value=57600)
         self.stage_interface_var = tk.StringVar(value="RS232 / COM")
@@ -107,6 +121,19 @@ class HeraTriggerApp(
         self.current_cycle_var = tk.StringVar(value="Cycle: -")
         self.current_site_var = tk.StringVar(value="Site: -")
         self.last_export_var = tk.StringVar(value="Last export: -")
+        self.default_output_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "output")
+        self.show_detail_log_var = tk.BooleanVar(value=False)
+        self.detail_log_messages = []
+        self.background_log_path = os.path.join(self.default_output_dir, "hera_background_status.log")
+        self.last_issues_log_path = os.path.join(self.default_output_dir, "hera_last_issues.log")
+        self.detail_log_path = self.background_log_path
+        self.recent_issue_messages = []
+        self._original_sys_excepthook = sys.excepthook
+        self._original_threading_excepthook = getattr(threading, "excepthook", None)
+        self._installed_sys_excepthook = None
+        self._installed_threading_excepthook = None
+        self._install_background_exception_logging()
+        self._write_startup_log_marker()
         self.hyperlab_shortcut_var = tk.StringVar(value=r"C:\Users\Public\Desktop\Nireos HyperLAB.lnk")
         self.hypercube_summary_var = tk.StringVar(value="Cube: waiting for acquisition")
         self.live_view_status_var = tk.StringVar(value="Live view: waiting for frames")
@@ -136,6 +163,8 @@ class HeraTriggerApp(
         self.live_roi_selecting = False
         self.live_roi_points = []
         self.live_roi_rect = None
+        self.roi_fields_initialized_from_live_frame = False
+        self.roi_fields_frame_size = None
         self.roi_selection_active = False
         self.selected_export_roi = None
         self.live_view_crop_roi = None
@@ -154,23 +183,47 @@ class HeraTriggerApp(
         self.resume_live_after_acquisition = False
         self.last_applied_roi = None
         self.acquisition_requested_roi = None
+        self.acquisition_camera_roi = None
         self.acquisition_requested_hdr = False
         self.live_max_preview_width = 480
+        self.live_display_rotation_degrees = 90
         self.live_auth_warning_logged = False
         self.last_live_decode_error = ""
         self.is_closing = False
+        self.shutdown_complete_event = threading.Event()
+        self.shutdown_thread = None
+        self.shutdown_watchdog_timer = None
         self.hyper_photo = None
         self.current_hypercube_handle = None
         self.current_hypercube_info = None
         self.current_hyper_band_cache = {}
         self.current_hyper_spectrum_cache = {}
+        self.current_hyper_pointer_cache = {}
         self.hyper_selected_pixel = None
+        self.hyper_cursor_pixel = None
+        self.hyper_selected_spectrum = None
+        self.hyper_cursor_spectrum = None
+        self.hyper_flatfield_spectrum = None
+        self.hyper_spectrum_loading = ""
+        self.hyper_spectrum_error = ""
+        self.hyper_spectrum_y_limits = None
+        self.hyper_spectrum_request_ids = {"selected": 0, "cursor": 0, "warmup": 0}
+        self.hyper_cursor_spectrum_inflight = False
+        self.hyper_cursor_pending_pixel = None
+        self.hyper_cross_enabled_var = tk.BooleanVar(value=True)
+        self.hyper_display_mode_var = tk.StringVar(value="Normalized")
         self.hyper_display_rect = None
         self.flatfield_hypercube_handle = None
         self.flatfield_info = None
         self.flatfield_status_var = tk.StringVar(value="Flatfield: none")
-        self.use_flatfield_var = tk.BooleanVar(value=True)
-        self.flatfield_at_timelapse_start_var = tk.BooleanVar(value=False)
+        self.flatfield_output_path_var = tk.StringVar(value=self.default_output_dir)
+        self.flatfield_name_var = tk.StringVar(value="flatfield")
+        self.flatfield_append_time_var = tk.BooleanVar(value=True)
+        self.export_name_var = tk.StringVar(value="")
+        self.export_append_time_var = tk.BooleanVar(value=True)
+        self.export_raw_var = tk.BooleanVar(value=True)
+        self.export_flatfield_var = tk.BooleanVar(value=True)
+        self.export_normalized_var = tk.BooleanVar(value=True)
         self.pending_acquisition_role = "sample"
         self.pending_save_context = None
         self.pending_acquisition_auto_save = True
@@ -199,6 +252,7 @@ class HeraTriggerApp(
         self.update_state("Idle")
         self.start_stage_polling()
         self._safe_after(250, self.auto_connect_devices)
+        self._safe_after(5000, self.start_nis_z_polling)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _live_cursor_status_text(self, text):
@@ -207,26 +261,273 @@ class HeraTriggerApp(
     def update_state(self, state_key):
         label = self.STATE_LABELS.get(state_key, state_key)
         self.app_state = label
-        self.app_state_var.set(label)
-        self.app_state_label.config(fg="red" if state_key == "Error" else "green")
+        if hasattr(self, "app_state_var"):
+            self.app_state_var.set(label)
+        if hasattr(self, "app_state_label"):
+            self.app_state_label.config(fg="red" if state_key == "Error" else "green")
+        if hasattr(self, "right_app_state_label"):
+            self.right_app_state_label.config(fg="red" if state_key == "Error" else "#7ad97a")
 
-    def log(self, message):
+    def _log_timestamp(self):
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _rotate_log_if_large(self, path, max_bytes=8 * 1024 * 1024):
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+                backup_path = f"{path}.old"
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                os.replace(path, backup_path)
+        except Exception:
+            pass
+
+    def _write_log_file_lines(self, path, lines, mode="a"):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._rotate_log_if_large(path)
+            timestamp = self._log_timestamp()
+            with open(path, mode, encoding="utf-8") as log_file:
+                for line in lines:
+                    text = str(line)
+                    split_lines = text.splitlines() or [""]
+                    for split_line in split_lines:
+                        log_file.write(f"{timestamp} | {split_line}\n")
+                log_file.flush()
+        except Exception:
+            pass
+
+    def _write_detail_log_line(self, message):
+        self._write_log_file_lines(self.detail_log_path, [message])
+
+    def _write_startup_log_marker(self):
+        self._write_log_file_lines(
+            self.detail_log_path,
+            [
+                "",
+                "=== HERA app started ===",
+                f"Background log: {self.detail_log_path}",
+                f"Last issues summary: {self.last_issues_log_path}",
+            ],
+        )
+        self._write_last_issues_log()
+
+    def _safe_log_var(self, var, fallback="-"):
+        try:
+            return var.get()
+        except Exception:
+            return fallback
+
+    def _is_issue_log_message(self, message):
+        lower = str(message).lower()
+        issue_tokens = (
+            "failed",
+            "error",
+            "warning",
+            "exception",
+            "traceback",
+            "crash",
+            "timeout",
+            "timed out",
+            "aborted",
+            "invalid",
+            "could not",
+            "unable",
+        )
+        return any(token in lower for token in issue_tokens)
+
+    def _write_last_issues_log(self, latest_trace=None):
+        lines = [
+            "HERA last issues summary",
+            f"Updated: {self._log_timestamp()}",
+            f"App state: {getattr(self, 'app_state', '-')}",
+            f"Current site: {self._safe_log_var(getattr(self, 'current_site_var', None))}",
+            f"Cycle: {self._safe_log_var(getattr(self, 'current_cycle_var', None))}",
+            f"Last export: {self._safe_log_var(getattr(self, 'last_export_var', None))}",
+            f"Full background log: {self.detail_log_path}",
+            "",
+            "Recent issues:",
+        ]
+        if self.recent_issue_messages:
+            lines.extend(self.recent_issue_messages[-40:])
+        else:
+            lines.append("No issue messages recorded in this app session yet.")
+        lines.extend(["", "Recent background log tail:"])
+        for text, _is_detail in self.detail_log_messages[-80:]:
+            lines.append(f"- {text}")
+        if latest_trace:
+            lines.extend(["", "Latest traceback:", latest_trace])
+        self._write_log_file_lines(self.last_issues_log_path, lines, mode="w")
+
+    def _record_recent_issue(self, message, trace_text=None):
+        entry = f"{self._log_timestamp()} | {message}"
+        if trace_text:
+            entry = f"{entry}\n{trace_text.rstrip()}"
+        self.recent_issue_messages.append(entry)
+        del self.recent_issue_messages[:-80]
+        self._write_last_issues_log(latest_trace=trace_text)
+
+    def _install_background_exception_logging(self):
+        self._installed_sys_excepthook = self._handle_sys_exception
+        sys.excepthook = self._installed_sys_excepthook
+        if hasattr(threading, "excepthook"):
+            self._installed_threading_excepthook = self._handle_thread_exception
+            threading.excepthook = self._installed_threading_excepthook
+
+    def _restore_background_exception_logging(self):
+        try:
+            if self._installed_sys_excepthook and sys.excepthook == self._installed_sys_excepthook:
+                sys.excepthook = self._original_sys_excepthook
+        except Exception:
+            pass
+        try:
+            if (
+                self._installed_threading_excepthook
+                and hasattr(threading, "excepthook")
+                and threading.excepthook == self._installed_threading_excepthook
+            ):
+                threading.excepthook = self._original_threading_excepthook
+        except Exception:
+            pass
+
+    def _handle_sys_exception(self, exc_type, exc_value, exc_traceback):
+        self._log_unhandled_exception("Unhandled Python exception", exc_type, exc_value, exc_traceback)
+        original = self._original_sys_excepthook
+        if original and original != self._installed_sys_excepthook:
+            original(exc_type, exc_value, exc_traceback)
+
+    def _handle_thread_exception(self, args):
+        if args.exc_type is SystemExit:
+            return
+        thread_name = getattr(args.thread, "name", "unknown")
+        self._log_unhandled_exception(
+            f"Unhandled thread exception ({thread_name})",
+            args.exc_type,
+            args.exc_value,
+            args.exc_traceback,
+        )
+        original = self._original_threading_excepthook
+        if original and original != self._installed_threading_excepthook:
+            original(args)
+
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback):
+        self._log_unhandled_exception("Unhandled Tk callback exception", exc_type, exc_value, exc_traceback)
+
+    def _log_unhandled_exception(self, title, exc_type, exc_value, exc_traceback):
+        trace_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        summary = f"{title}: {exc_value}"
+        self._write_log_file_lines(self.detail_log_path, [summary, trace_text])
+        self.detail_log_messages.append((summary, False))
+        self._record_recent_issue(summary, trace_text)
+        try:
+            if hasattr(self, "log_text") and self.log_text.winfo_exists():
+                self._append_visible_log_line(summary)
+        except Exception:
+            pass
+
+
+    def _is_essential_log_message(self, message):
+        text = str(message).strip()
+        lower = text.lower()
+        if not lower:
+            return False
+        detail_prefixes = (
+            "first live frame received:",
+            "live preview auto-contrast",
+            "live saturation threshold",
+            "live preview rendered successfully",
+            "supported live pixel formats",
+            "hyperspectral band ",
+            "acquisition callback received:",
+            "raw hyperspectral data received:",
+            "hypercube ready:",
+            "stopping hera live view",
+            "restarting hera live view",
+            "set hdr:",
+            "set gain level:",
+            "gain is read-only",
+            "set exposure:",
+            "exposure is read-only",
+            "using default bands",
+            "acquisition parameters applied.",
+            "hdr re-asserted",
+            "preparing hera camera parameters",
+            "sending software acquisition command",
+            "no roi is active.",
+            "roi cleared on hera",
+        )
+        if lower.startswith(detail_prefixes):
+            return False
+        essential_tokens = (
+            "failed",
+            "error",
+            "warning",
+            "aborted",
+            "stopped",
+            "connected",
+            "verified",
+            "licensed",
+            "license",
+            "started",
+            "complete",
+            "completed",
+            "ready",
+            "saved",
+            "exported",
+            "moving",
+            "reached",
+            "cycle",
+            "site",
+            "timelapse",
+            "acquisition",
+            "flatfield",
+            "roi",
+            "nis z",
+            "tango",
+            "hera",
+        )
+        return any(token in lower for token in essential_tokens)
+
+    def _append_visible_log_line(self, message):
         self.log_text.config(state="normal")
         self.log_text.insert("end", f"{message}\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
+    def refresh_visible_log(self):
+        if not hasattr(self, "log_text"):
+            return
+        show_details = bool(self.show_detail_log_var.get()) if hasattr(self, "show_detail_log_var") else False
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        for text, is_detail in self.detail_log_messages:
+            if show_details or not is_detail:
+                self.log_text.insert("end", f"{text}\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def log(self, message, detail=None):
+        text = str(message)
+        is_detail = (not self._is_essential_log_message(text)) if detail is None else bool(detail)
+        self.detail_log_messages.append((text, is_detail))
+        self._write_detail_log_line(text)
+        if self._is_issue_log_message(text):
+            self._record_recent_issue(text)
+        if not hasattr(self, "log_text"):
+            return
+        if self.show_detail_log_var.get() or not is_detail:
+            self._append_visible_log_line(text)
+
     def on_close(self):
         if self.is_closing:
             return
+        self._write_detail_log_line("Close requested; starting cleanup.")
         self.is_closing = True
-        hard_exit_timer = threading.Timer(3.0, lambda: os._exit(0))
-        hard_exit_timer.daemon = True
-        hard_exit_timer.start()
+        self.shutdown_complete_event.clear()
         self.timelapse_stop_event.set()
         self.timelapse_pause_event.clear()
         self.acquisition_done_event.set()
-        for job_attr in ("stage_poll_job", "nis_z_poll_job", "live_watchdog_job"):
+        self.resume_live_after_acquisition = False
+        for job_attr in ("stage_poll_job", "nis_z_poll_job", "live_watchdog_job", "_auto_apply_parameters_job"):
             job = getattr(self, job_attr, None)
             if job:
                 try:
@@ -234,22 +535,73 @@ class HeraTriggerApp(
                 except Exception:
                     pass
             setattr(self, job_attr, None)
-        self._cleanup_hardware()
-        self.quit()
-        self.destroy()
+        try:
+            self.withdraw()
+        except tk.TclError:
+            pass
+
+        self.shutdown_watchdog_timer = threading.Timer(8.0, self._force_exit_after_shutdown_timeout)
+        self.shutdown_watchdog_timer.daemon = True
+        self.shutdown_watchdog_timer.start()
+        self.shutdown_thread = threading.Thread(target=self._shutdown_worker, name="HeraShutdown")
+        self.shutdown_thread.daemon = True
+        self.shutdown_thread.start()
+        try:
+            self.after(50, self._poll_shutdown_complete)
+        except (RuntimeError, tk.TclError):
+            self._finish_close(cancel_watchdog=False)
+
+    def _shutdown_worker(self):
+        try:
+            self._cleanup_hardware()
+        finally:
+            self.shutdown_complete_event.set()
+
+    def _poll_shutdown_complete(self):
+        if self.shutdown_complete_event.is_set():
+            self._finish_close()
+            return
+        try:
+            self.after(50, self._poll_shutdown_complete)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _finish_close(self, cancel_watchdog=True):
+        self._write_detail_log_line("Shutdown cleanup completed.")
+        timer = getattr(self, "shutdown_watchdog_timer", None)
+        if timer and cancel_watchdog:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+            self.shutdown_watchdog_timer = None
+        try:
+            self.quit()
+        except (RuntimeError, tk.TclError):
+            pass
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except (RuntimeError, tk.TclError):
+            pass
+        self._restore_background_exception_logging()
+
+    def _force_exit_after_shutdown_timeout(self):
+        self._write_detail_log_line("Shutdown watchdog forced process exit after cleanup timeout.")
         os._exit(0)
 
     def _cleanup_hardware(self):
         try:
             if self.tango and self.tango.connected:
-                try:
-                    self.tango.stop_axes()
-                except Exception:
-                    pass
-                try:
-                    self.tango.disconnect()
-                except Exception:
-                    pass
+                with self.stage_lock:
+                    try:
+                        self.tango.stop_axes()
+                    except Exception:
+                        pass
+                    try:
+                        self.tango.disconnect()
+                    except Exception:
+                        pass
         except Exception:
             pass
         try:
@@ -257,13 +609,15 @@ class HeraTriggerApp(
                 if self.current_hypercube_handle:
                     try:
                         if self.current_hypercube_handle != self.flatfield_hypercube_handle:
-                            self.controller.release_hypercube(self.current_hypercube_handle)
+                            with self.hypercube_read_lock:
+                                self.controller.release_hypercube(self.current_hypercube_handle)
                     except Exception:
                         pass
                     self.current_hypercube_handle = None
                 if self.flatfield_hypercube_handle:
                     try:
-                        self.controller.release_hypercube(self.flatfield_hypercube_handle)
+                        with self.hypercube_read_lock:
+                            self.controller.release_hypercube(self.flatfield_hypercube_handle)
                     except Exception:
                         pass
                     self.flatfield_hypercube_handle = None
