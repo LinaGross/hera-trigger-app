@@ -2,6 +2,7 @@ import os
 import re
 import time
 import uuid
+import array
 from pathlib import Path
 
 
@@ -97,21 +98,38 @@ class ExportMixin:
             should_crop_export = (roi_x, roi_y, roi_w, roi_h) != (0, 0, cube_width, cube_height)
 
         if should_crop_export:
-            temp_output_path = f"{output_base_path}_fullframe_tmp_{uuid.uuid4().hex[:8]}"
-            self._log_async(
-                f"ROI diagnostic: exporting {log_label} full frame temporarily, then cropping "
-                f"to x={export_roi[0]}, y={export_roi[1]}, w={export_roi[2]}, h={export_roi[3]}."
+            bands = int(info.get("bands") or 0)
+            data_type = int(info.get("data_type") if info.get("data_type") is not None else 0)
+            if bands and data_type in (0, 1):
+                try:
+                    return self._export_hypercube_roi_envi_direct(
+                        hypercube_handle,
+                        output_base_path,
+                        export_roi,
+                        cube_width,
+                        cube_height,
+                        bands,
+                        data_type,
+                        description,
+                        log_label,
+                    )
+                except Exception as exc:
+                    self._log_async(
+                        f"Direct ROI export failed for {log_label}: {exc}. "
+                        "Falling back to full-frame SDK export plus crop."
+                    )
+            else:
+                self._log_async(
+                    f"Direct ROI export skipped for {log_label}: missing bands/data type in export info. "
+                    "Falling back to full-frame SDK export plus crop."
+                )
+            return self._export_hypercube_fullframe_then_crop(
+                hypercube_handle,
+                output_base_path,
+                description,
+                export_roi,
+                log_label,
             )
-            self.controller.export_hypercube_envi(hypercube_handle, temp_output_path, description)
-            self._wait_for_export_files(temp_output_path)
-            crop_description = (
-                f"{description}\n"
-                f"Post-export ROI crop: x={export_roi[0]}, y={export_roi[1]}, "
-                f"width={export_roi[2]}, height={export_roi[3]}"
-            )
-            hdr_path = self._crop_exported_envi_to_roi(temp_output_path, output_base_path, export_roi, crop_description)
-            self._remove_export_files(temp_output_path)
-            return hdr_path
 
         if export_roi:
             self._log_async(f"ROI diagnostic: {log_label} already matches the selected ROI size; exporting directly.")
@@ -119,6 +137,127 @@ class ExportMixin:
         hdr_path = self._wait_for_export_files(output_base_path)
         data_path = self._find_envi_data_file(output_base_path)
         self._patch_envi_header_for_hyperlab(hdr_path, data_path)
+        return hdr_path
+
+    def _export_hypercube_fullframe_then_crop(self, hypercube_handle, output_base_path, description, export_roi, log_label):
+        temp_output_path = f"{output_base_path}_fullframe_tmp_{uuid.uuid4().hex[:8]}"
+        self._log_async(
+            f"ROI diagnostic: exporting {log_label} full frame temporarily, then cropping "
+            f"to x={export_roi[0]}, y={export_roi[1]}, w={export_roi[2]}, h={export_roi[3]}."
+        )
+        self.controller.export_hypercube_envi(hypercube_handle, temp_output_path, description)
+        self._wait_for_export_files(temp_output_path)
+        crop_description = (
+            f"{description}\n"
+            f"Post-export ROI crop: x={export_roi[0]}, y={export_roi[1]}, "
+            f"width={export_roi[2]}, height={export_roi[3]}"
+        )
+        try:
+            return self._crop_exported_envi_to_roi(temp_output_path, output_base_path, export_roi, crop_description)
+        finally:
+            self._remove_export_files(temp_output_path)
+
+    def _export_hypercube_roi_envi_direct(
+        self,
+        hypercube_handle,
+        output_base_path,
+        roi,
+        source_width,
+        source_height,
+        bands,
+        data_type,
+        description,
+        log_label,
+    ):
+        roi_x, roi_y, roi_w, roi_h = (int(value) for value in roi)
+        roi_x = max(0, min(roi_x, source_width - 1))
+        roi_y = max(0, min(roi_y, source_height - 1))
+        roi_w = max(1, min(roi_w, source_width - roi_x))
+        roi_h = max(1, min(roi_h, source_height - roi_y))
+        raw_path = output_base_path
+        hdr_path = output_base_path + ".hdr"
+        temp_suffix = f".tmp_{uuid.uuid4().hex[:8]}"
+        temp_raw_path = raw_path + temp_suffix
+        temp_hdr_path = hdr_path + temp_suffix
+        envi_data_type = 4 if data_type == 0 else 5
+        array_typecode = "f" if data_type == 0 else "d"
+        wavelengths = []
+        final_raw_replaced = False
+
+        try:
+            import numpy as np
+        except Exception:
+            np = None
+
+        def write_band_with_numpy(raw_file, values):
+            band_array = np.ctypeslib.as_array(values, shape=(source_height, source_width))
+            roi_array = band_array[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
+            roi_array.astype("<f4" if data_type == 0 else "<f8", copy=False).tofile(raw_file)
+
+        def write_band_with_python(raw_file, values):
+            for row in range(roi_y, roi_y + roi_h):
+                start = row * source_width + roi_x
+                stop = start + roi_w
+                array.array(array_typecode, (values[index] for index in range(start, stop))).tofile(raw_file)
+
+        try:
+            self._log_async(
+                f"ROI diagnostic: exporting {log_label} directly from hypercube memory "
+                f"to x={roi_x}, y={roi_y}, w={roi_w}, h={roi_h}, bands={bands}."
+            )
+            with self.hypercube_read_lock:
+                with open(temp_raw_path, "wb") as raw_file:
+                    for band_index in range(bands):
+                        wavelength, values = self.controller.get_hypercube_band_pointer(
+                            hypercube_handle,
+                            band_index,
+                            data_type,
+                        )
+                        if np is not None:
+                            write_band_with_numpy(raw_file, values)
+                        else:
+                            write_band_with_python(raw_file, values)
+                        wavelengths.append(wavelength)
+                        if band_index == 0 or (band_index + 1) % 10 == 0 or band_index + 1 == bands:
+                            self._log_async(f"Direct ROI export progress ({log_label}): band {band_index + 1}/{bands}")
+
+            safe_description = (description or "Generated by AppHeraTriggerPython0417").replace("}", ")")
+            safe_description = (
+                f"{safe_description}\n"
+                f"Direct ROI export: x={roi_x}, y={roi_y}, width={roi_w}, height={roi_h}"
+            )
+            wavelength_text = ", ".join(f"{wavelength:.6f}" for wavelength in wavelengths)
+            header = (
+                "ENVI\n"
+                f"description = {{{safe_description}}}\n"
+                f"samples = {roi_w}\n"
+                f"lines = {roi_h}\n"
+                f"bands = {bands}\n"
+                "header offset = 0\n"
+                "file type = ENVI Standard\n"
+                f"data file = {os.path.basename(raw_path)}\n"
+                f"data type = {envi_data_type}\n"
+                "interleave = bsq\n"
+                "byte order = 0\n"
+                f"wavelength = {{{wavelength_text}}}\n"
+            )
+            Path(temp_hdr_path).write_text(header, encoding="utf-8")
+            os.replace(temp_raw_path, raw_path)
+            final_raw_replaced = True
+            os.replace(temp_hdr_path, hdr_path)
+        except Exception:
+            for path in (temp_raw_path, temp_hdr_path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+            if final_raw_replaced and not os.path.exists(hdr_path):
+                try:
+                    os.remove(raw_path)
+                except Exception:
+                    pass
+            raise
         return hdr_path
 
     def _find_envi_data_file(self, output_base_path):
