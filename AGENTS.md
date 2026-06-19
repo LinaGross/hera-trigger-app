@@ -1,164 +1,127 @@
 # Agent Notes: HERA App And NIS Z Bridge
 
-This repo controls a HERA camera/stage app and a separate NIS-Elements Z-axis bridge. Work carefully and keep GitHub as the source of truth.
+This repo controls the HERA camera/stage app and the NIS-Elements Z-axis bridge. Work carefully, make small changes, and keep GitHub as the source of truth.
 
-## Code Structure
+## Repo Rules
 
-The app was refactored from a single 5,666-line file into a `hera_app/` package. `AppHeraTriggerPython0417.py` is now a 4-line launcher — do not edit it.
+- Preserve user changes. Do not reset or revert the repo unless the user explicitly asks.
+- Keep meaningful fixes committed/pushed to GitHub when the user asks to publish or when NIS-side files need deployment.
+- `AppHeraTriggerPython0417.py` is only the launcher. Do not put app logic there.
+- After every code change, tell the user exactly how to verify it: concrete app actions, expected results, and logs/files to inspect. If hardware testing was not possible locally, say that clearly.
 
-All logic lives in:
+## App Structure
 
-```
+Most logic lives under `hera_app/`.
+
+```text
 hera_app/
-    app.py                        HeraTriggerApp class + __init__ + on_close + main()
+    app.py                        HeraTriggerApp init, state, logging, shutdown, main()
     controllers/
-        hera.py                   HeraDeviceInfo, HeraController (SDK DLL wrapper)
-        tango.py                  TangoController (stage DLL wrapper)
-        nis_z.py                  NISZBridgeController (file-bridge TCP wrapper)
+        hera.py                   Hera SDK / HeraAPI.dll wrapper
+        tango.py                  Tango stage / Tango_DLL.dll wrapper
+        nis_z.py                  NIS Z shared-folder bridge client
     mixins/
-        theme.py                  _configure_theme, _apply_theme_recursive, toggle_theme_mode
-        ui_builder.py             all _build_* UI construction methods
-        device.py                 connect/disconnect Hera + Tango, license, preflight, HDR
-        nis_z_mixin.py            NIS Z bridge polling and control
-        stage.py                  stage motion, position management, Z moves
-        export.py                 ENVI file helpers, tag sanitisation, ROI crop
-        flatfield.py              flatfield acquisition, normalization, clear
-        acquisition.py            parameter apply, arm/start acquisition, worker
-        timelapse.py              timelapse/cycle worker, site acquisition
-        live_view.py              live capture, rendering, zoom, pan, snapshots
-        roi.py                    ROI selection, overlays, cursor readout
-        hyperspectral_viewer.py   band viewer, spectrum panel
-        utils.py                  _safe_after, _log_async, _set_var_async
+        ui_builder.py             UI construction and widget behavior
+        device.py                 Hera/Tango connection, license, preflight, HDR
+        acquisition.py            parameter apply, acquisition, callback worker, saving
+        timelapse.py              cycle/site/timelapse worker
+        live_view.py              live capture, rendering, zoom/pan/snapshot
+        roi.py                    ROI selection, coordinate mapping, overlays
+        flatfield.py              flatfield reference, normalization helpers
+        hyperspectral_viewer.py   band display and spectrum panel
+        export.py                 ENVI export, ROI crop, HyperLAB header patching
+        stage.py                  stage motion and saved positions
+        nis_z_mixin.py            NIS Z polling and controls
+        theme.py                  light/dark theme
+        utils.py                  safe Tk scheduling and async UI helpers
 ```
 
-When making changes, open the relevant mixin file directly rather than the entry-point file. Use Ctrl+Shift+F to search across files if unsure where a method lives.
+Open the relevant mixin/controller directly before editing. Use search if a method location is unclear.
 
-## Overall Goal
+## Core App Invariants
 
-Coordinate these files so the HERA PC and NIS PC can work together:
+- The active UI is a three-pane layout: left status/exposure/ROI/XYZ/saved positions/NIS Z, center spectral/live/hyperspectral views, right acquisition/timelapse/export controls. Add controls to the correct pane and avoid duplicate ROI or saved-position controls.
+- UI controls should be immediate where safe: buttons/checkbuttons focus and invoke on Enter, entries commit on Enter or changed FocusOut, and connected camera option variables auto-apply with debounce. Do not add generic Apply buttons for camera parameters or ROI fields.
+- Keep camera parameter apply off the Tk main thread. Stop live capture in a worker when needed, apply settings, then schedule UI updates/live restart back on Tk.
+- Background logging is always on. Keep the Tk/Python/thread exception hooks and the `Open Log` button wired to `hera_last_issues.log`; the full log is `hera_background_status.log`.
+- Light/dark mode uses `theme_mode`, `theme_button_var`, `_configure_theme`, and `toggle_theme_mode`. New widgets should use `self.theme[...]` colors where practical.
 
-- `AppHeraTriggerPython0417.py`
-- `NIS-Z-Bridge/nis_z_sync_shared_to_local.py`
-- `NIS-Z-Bridge/nis_z_local_text_bridge_watcher.mac`
-- `NIS-Z-Bridge/nis_z_macro_hotkey_runner.ps1`
+## ROI And Saved Positions
 
-The immediate blocker is reliable GET Z from NIS into the HERA UI. The larger goal is full XYZ support:
+- Live ROI is display-driven: two clicks on the rendered live image are inverse-mapped to Hera live-frame pixels and copied into ROI fields.
+- Keep the user-selected export ROI separate from camera ROI readback. Hera can report ROI as read-only/full-frame even when the user selected a smaller region.
+- ROI can be edited by corners, size fields, or area helper, but Hera ultimately receives rectangular `x, y, width, height`. Normalize corner edits back to rectangular ROI fields and update `roi_selection_active` / `selected_export_roi`.
+- Saved positions include per-site ROI in `SavedPosition.roi`. Adding/updating/saving a site captures the active ROI; selecting a site restores it.
+- Manual site runs, `Run First 2 Sites`, and timelapse use the saved ROI for each site, falling back to the timelapse-start ROI only when the site has no saved ROI.
+- The saved positions list starts empty. Do not seed a default `Start` or `0,0` position.
+- If NIS Z is unavailable, save `dummy_z_position` (`0.000`) so XY sites remain usable.
 
-- display Z everywhere XY is displayed
-- display Z beside GET Z
-- allow arbitrary Z moves, not only predefined increments
-- include X, Y, and Z in acquisition loops
-- after each hyperspectral image, move back to the correct XYZ position
+## Hyperspectral, Export, And HyperLAB
 
-## Machines And Paths
+- Hyperspectral ROI is enforced after SDK acquisition when needed. The SDK may return a full-frame hypercube even for a selected ROI.
+- For post-export ROI, export a temporary full-frame ENVI cube, scale the live-frame ROI into returned hypercube dimensions, crop binary/header on disk, remove temp files, and crop displayed bands so the viewer matches saved files.
+- Do not crop a returned smaller hypercube with unscaled 3200x3200 live-frame coordinates.
+- Export options must respect the right-side Export panel. `_raw` is always possible; `_ref` and `_nrm` require a loaded, compatible flatfield and are still checked at save time.
+- ENVI exports must stay HyperLAB-friendly: keep `file type = ENVI Standard` and `data file = <matching data filename>` in headers after SDK export, ROI crop, or normalized export.
+- Export naming uses `export_name_var` and `export_append_time_var`; saving notes use `saving_notes_var` and go into ENVI descriptions.
+- HyperLAB opening uses `hyperlab_shortcut_var`, default `C:\Users\Public\Desktop\Nireos HyperLAB.lnk`. Resolve it to `HyperLAB.exe`, pass the selected/latest `.hdr`, and copy the path to clipboard. If `last_export_path` is empty, search output for the newest `_raw`, `_ref`, or `_nrm` `.hdr`.
 
-The HERA PC runs the HERA app and writes requests to a shared NAS folder.
+## Flatfield
 
-The NIS PC controls the microscope and runs a local bridge from:
+- Flatfield follows the Hera Acquisition App model: acquire a white diffuse/reference surface with `Acquire`, store it in `flatfield_hypercube_handle`, and use it until the user acquires a new flatfield, clears it, disconnects Hera, or closes the app.
+- Compatible sample cubes display/export normalized data as `sample / flatfield`.
+- Compatibility currently requires matching source size, displayed ROI coverage, band count, and data type.
+- Hyperspectral View has `Normalized`, `Raw`, and `Flatfield` modes. `Normalized` shows the current sample divided by the compatible flatfield, `Raw` shows the native sample cube, and `Flatfield` shows the stored reference cube.
+- Keep selected/cursor spectra tied to the active display mode, with a separate flatfield spectrum for comparison when showing a sample cube.
+- Flatfield saving uses the same right-side `Export` button and shared output folder/name/stamp controls. Do not reintroduce a separate `Save Flatfield Ref` button. A pending flatfield acquisition saves as `_ref`.
+
+## Live View
+
+- Live cursor coordinates are display-only. The live preview is presentation-rotated with `live_display_rotation_degrees = 90` so Tango right/left motion is horizontal in the display.
+- Inverse-map cursor, crosshair, ROI overlay, ROI clicks, and snapshots through the same live-frame orientation helpers. Do not reintroduce pixel-scale, invert-axis, or swap-axis controls unless the user explicitly asks.
+- Live exposure helpers are display-only: `Auto Contrast`, `Gamma`, `Show Saturation`, `Cross`, and `Snapshot` must not alter camera exposure, gain, ROI, or acquisition data.
+- `Live View HDR` is a live-preview aid, not a guaranteed hyperspectral HDR acquisition mode. Record SDK-reported raw/cube HDR flags in logs/export descriptions instead of assuming HDR cubes were saved.
+- Keep the live cursor readout compact and stable in the left Status panel.
+
+## NIS Z Bridge Rules
+
+The HERA PC writes requests through the shared NAS folder. The NIS PC controls the microscope and runs the local bridge from:
 
 ```text
 E:\Jiayi\NISZBridge
 ```
 
-The only shared communication path is:
+The only shared path is:
 
 ```text
 \\sti-nas1.rcp.epfl.ch\bios\bios-raw\backups\visible\cell\Jiayi_bios-raw\Z control shared
 ```
 
-Do not make the NIS macro read or write the UNC path directly. The macro should only touch local files under `E:\Jiayi\NISZBridge`.
+Rules:
 
-## Current Bridge Architecture
-
-HERA writes request files into:
-
-```text
-Z control shared\commands\
-```
-
-The NIS sync script maps those request files into fixed local slots:
-
-```text
-E:\Jiayi\NISZBridge\commands\current_getz.txt
-E:\Jiayi\NISZBridge\state\current_getz.id
-```
-
-The hotkey runner notices local command files and sends F4 to NIS-Elements. The NIS macro runs once per F4, calls Nikon/NIS stage APIs, and writes local responses:
-
-```text
-E:\Jiayi\NISZBridge\responses\current_getz_response.txt
-```
-
-The sync script publishes the response back to:
-
-```text
-Z control shared\responses\<hera_request_id>.txt
-```
-
-## GET Z Flow
-
-1. HERA writes `shared\commands\hera_YYYYMMDD_HHMMSS_xxxxxxxx.txt` containing `GET_Z`.
-2. `nis_z_sync_shared_to_local.py` forwards the newest fresh command to `commands\current_getz.txt`.
-3. The sync writes `state\current_getz.id` containing the HERA request id.
-4. `nis_z_macro_hotkey_runner.ps1` sees `current_getz.txt` and sends F4 to NIS-Elements.
-5. `nis_z_local_text_bridge_watcher.mac` runs once.
-6. The macro calls `StgGetPosZ(&z, 0)`.
-7. The macro writes `responses\current_getz_response.txt`.
-8. The sync publishes to `shared\responses\<hera_request_id>.txt`.
-9. HERA reads the response and displays Z in micrometers.
-
-Response format:
-
-```text
-OK 5726.400000
-```
-
-or:
-
-```text
-ERROR message here
-```
-
-## Known Fragile Areas
-
-- The NIS macro is sensitive. Make small, deliberate edits.
-- `StgZ_GetLimits` is unstable and has caused NIS to close. Do not use it.
-- `Python_RunFile(...)` is not available in this NIS installation. Do not use it.
-- NIS macros cannot reliably read/write the UNC NAS path. Keep macro I/O local.
-- `WriteFile(...)` in the NIS macro has been fragile. Previous small byte counts truncated responses. The current code used larger byte counts, but partial values like `OK 57` have appeared, so response completeness must be guarded.
-- `RenameFile(...)` argument order and destination collisions are important. Confirm behavior before changing it.
-- If `commands\current_getz.txt` remains without `state\current_getz.id`, new requests are blocked.
-- If `commands\current_getz.txt` and `state\current_getz.id` remain too long without a valid response, the slot is stale and should be archived by the sync.
+- Do not make the NIS macro read/write the UNC path directly. The macro should only touch local files under `E:\Jiayi\NISZBridge`.
+- The NIS macro is sensitive. Make small edits and inspect local/GitHub context before changing it.
+- Do not use `StgZ_GetLimits`; it has caused NIS to close.
+- Do not use `Python_RunFile(...)`; it is unavailable in this NIS installation.
+- `WriteFile(...)` can truncate responses if byte counts are too small. Guard response completeness; partial values like `OK 57` have appeared.
+- `RenameFile(...)` argument order and destination collisions matter. Confirm behavior before changing it.
 - The hotkey runner must not hammer F4 or delete responses while the macro is writing.
-- The HERA app must reset pending Z request state after timeout/failure and should fully exit on close to avoid duplicate HERA app instances.
-- HERA live capture can make gain/exposure/ROI read-only or slow to stop. Keep parameter apply off the Tk main thread: pause live capture in a worker, apply camera settings, then schedule UI updates and live restart back on Tk.
-- Live cursor coordinates are display-only. The live preview is presentation-rotated with `live_display_rotation_degrees = 90` so Tango right/left motion is horizontal in the display; the app must inverse-map cursor, crosshair, ROI overlay, ROI clicks, and snapshots back through the same live-frame orientation helpers. Do not expose pixel-scale, invert-axis, or swap-axis controls unless the user explicitly asks for that workflow again.
-- The active UI is a resizable three-pane layout: left for status/exposure/ROI/XYZ/saved positions/NIS Z, center for spectral settings and live/hyperspectral views, and right for acquisition/timelapse/saving. Keep new controls in the appropriate pane and avoid reintroducing duplicate saved-position or ROI controls elsewhere.
-- Light/dark mode is controlled by `theme_mode`, `theme_button_var`, `_configure_theme`, and `toggle_theme_mode`. When adding widgets, prefer `self.theme[...]` colors so the switch can recolor them.
-- UI controls should be immediate where safe: buttons/checkbuttons take focus on click and invoke on Enter, entries commit their matching action on Enter or changed FocusOut, and connected camera option variables auto-apply with a short debounce. Do not reintroduce generic Apply buttons for camera parameters or ROI fields; keep explicit command buttons only for deliberate actions such as acquisition, export, stage movement, browsing, or clearing state.
-- Background logging is always on. `hera_background_status.log` is the full timestamped log and `hera_last_issues.log` is the short file users should open after a crash. Keep Tk/Python/thread exception hooks installed early in `HeraTriggerApp.__init__`, and keep the `Open Log` button wired to the short issue summary.
-- Live ROI selection is display-driven: two clicks on the rendered live image are mapped back to Hera live-frame pixels and copied into the ROI parameter fields. Keep the user-selected export ROI separate from camera ROI readback; this matters because Hera can report ROI as read-only/full-frame even after the user selected a smaller region.
-- ROI can also be edited through top-left/bottom-right corners, size fields, or a near-square area helper. Hera still accepts rectangular `x, y, width, height`, so corner edits must be normalized back to rectangular ROI fields and should mark `roi_selection_active` / `selected_export_roi`.
-- Saved positions include per-site ROI in `SavedPosition.roi`. `Add Current Position`, `Update Selected Position`, and `Save Selected Edits` must capture the current active ROI. Selecting a saved position should restore that ROI into the controls. Manual site runs, `Run First 2 Sites`, and timelapse should use the saved ROI for each site, falling back to the current timelapse-start ROI only when the site has no saved ROI.
-- The saved positions list must start empty. Do not seed a default `Start`/`0,0` position; users add every acquisition site explicitly.
-- Hyperspectral ROI is enforced after SDK acquisition, not by relying on camera hardware ROI. The SDK may return a full-frame hypercube even when an ROI was selected. The app exports a temporary full-frame ENVI cube, scales the live-frame ROI into the returned hypercube/export dimensions, crops the binary/header on disk, removes temporary files, and crops bands in `render_current_hyper_band` so the Hyperspectral View matches the saved ROI cube. Do not crop a returned smaller hypercube with unscaled 3200x3200 live-frame coordinates.
-- Flatfield follows the Hera Acquisition App manual: acquire a white diffuse/reference surface with `Acquire`, keep that hypercube in `flatfield_hypercube_handle`, and use it as the persistent normalization reference until the user acquires a new flatfield or clears it. Compatible sample cubes display/export normalized data by dividing sample pixels by matching flatfield pixels; compatibility currently requires matching source size, displayed ROI, band count, and data type.
-- The Hyperspectral View has a `Show` selector with `Normalized`, `Raw`, and `Flatfield`. `Normalized` should display the current sample divided by the active compatible flatfield, `Raw` should display the native sample cube, and `Flatfield` should display the stored reference cube. Keep the selected/cursor spectrum behavior tied to the active display mode, with a separate flatfield spectrum for comparison when a sample cube is shown.
-- Flatfield saving uses the same right-side `Export` button and shared output folder/name/stamp controls as normal saving; do not reintroduce a separate `Save Flatfield Ref` button. A pending flatfield acquisition saves as `_ref`.
-- Auto-saved site/timelapse runs must respect the right-side Export panel. Before starting an auto-saved run, validate that at least one selected product is possible: `_raw` is always possible, while `_ref`/`_nrm` require a loaded flatfield. The actual save path still checks flatfield compatibility against the acquired cube.
-- Live exposure helpers are display-only. `Auto Contrast` stretches the rendered preview, `Gamma` remaps brightness after auto-contrast, `Show Saturation` paints saturated pixels red from the SDK live-frame saturation threshold, `Cross` shows fixed-point horizontal/vertical live intensity cuts with a red saturation-threshold reference line, and `Snapshot` writes the latest live frame as a PNG with those display choices applied. These controls must not alter camera exposure, gain, ROI, or acquisition data.
-- `Live View HDR` is a live-preview aid, not a guaranteed hyperspectral HDR acquisition mode. The SDK exposes `SetHDR`/`GetHDR` and live frames report HDR on, but on the tested Hera Kinetix MC setup the acquired hyperspectral raw data and computed hypercube still report `HDR=off`. Keep the UI/logs/export descriptions honest by recording the SDK-reported acquisition HDR flag rather than assuming HDR cubes were saved.
-- The live cursor readout should stay compact and stable in the left Status panel while moving the mouse over live view.
-- Export naming uses `export_name_var` and `export_append_time_var`; keep manual save and flatfield reference save tied to those shared Export panel controls. Saving notes are stored in `saving_notes_var` and appended to the ENVI export description.
-- HyperLAB opening uses `hyperlab_shortcut_var`, defaulting to `C:\Users\Public\Desktop\Nireos HyperLAB.lnk`. Resolve the shortcut to the installed `HyperLAB.exe` before launching, pass the current exported `.hdr` as the process argument, and copy the path to the clipboard. If `last_export_path` is empty after an app restart, search the output folder for the newest `_raw`, `_ref`, or `_nrm` `.hdr` and use that.
-- ENVI exports must stay HyperLAB-friendly: after SDK export, ROI crop, or normalized export, keep `file type = ENVI Standard` and `data file = <matching data filename>` in the `.hdr`. The SDK can write extensionless data files, and HyperLAB may not infer those reliably without the explicit `data file` line.
-- Saved positions use cached NIS Z when available; if Z is not solved/available, `dummy_z_position` (`0.000`) is stored so XY positions can still be added, edited, and used.
+- HERA must reset pending Z request state after timeout/failure and fully exit on close to avoid duplicate app instances.
+
+GET Z flow summary:
+
+1. HERA writes `Z control shared\commands\hera_YYYYMMDD_HHMMSS_xxxxxxxx.txt` containing `GET_Z`.
+2. `nis_z_sync_shared_to_local.py` forwards it to local fixed slots: `commands\current_getz.txt` and `state\current_getz.id`.
+3. `nis_z_macro_hotkey_runner.ps1` sends F4 to NIS-Elements.
+4. `nis_z_local_text_bridge_watcher.mac` calls `StgGetPosZ(&z, 0)` and writes `responses\current_getz_response.txt`.
+5. The sync publishes `Z control shared\responses\<hera_request_id>.txt`.
+6. HERA reads `OK 5726.400000` or `ERROR message here`.
+
+Stale local slots block new requests. If `current_getz.txt` and/or `current_getz.id` remain too long without a valid response, the sync should archive them.
 
 ## NIS PC Update From GitHub
 
-When changing NIS-side files in this repo, push to GitHub and give the user exact pull commands for the NIS PC.
-
-Use:
+When changing NIS-side files, push to GitHub and give the user exact NIS PC pull commands:
 
 ```powershell
 cd E:\Jiayi\NISZBridge
@@ -178,19 +141,17 @@ Invoke-WebRequest `
 
 If the macro changed, tell the user to reload `E:\Jiayi\NISZBridge\nis_z_local_text_bridge_watcher.mac` in NIS-Elements.
 
-## Startup Order
-
-Use this order for each test session:
+## NIS Test Session Startup
 
 1. On the NIS PC, open NIS-Elements and load `E:\Jiayi\NISZBridge\nis_z_local_text_bridge_watcher.mac`.
-2. Start the sync script:
+2. Start the sync:
 
 ```powershell
 cd E:\Jiayi\NISZBridge
 & C:\Users\adminbios\AppData\Local\Programs\Python\Python312\python.exe .\nis_z_sync_shared_to_local.py
 ```
 
-3. In another PowerShell window, start the hotkey runner:
+3. Start the hotkey runner in another PowerShell:
 
 ```powershell
 cd E:\Jiayi\NISZBridge
@@ -237,17 +198,11 @@ Get-ChildItem -LiteralPath "$root\responses" |
   Select-Object -First 5 Name,Length,LastWriteTime
 ```
 
-## Recent Debug History
+## Recent NIS Debug Context
 
-Recent symptoms:
+Recent symptoms included pending GET_Z requests not clearing, shared-response timeouts, truncated Z values such as `57.000 um` instead of `5726.xxx`, slow Ctrl+C exit in the sync script, and repeated/destructive F4 behavior in the hotkey runner.
 
-- HERA logs `NIS Z GET_Z ignored because another Z request is still waiting`.
-- HERA logs timeout waiting for a shared response.
-- Sometimes HERA displays a truncated/wrong Z such as `57.000 um` while NIS shows a longer value like `5726.xxx`.
-- The sync script previously did not stop promptly with Ctrl+C.
-- The hotkey runner previously sent F4 repeatedly and deleted incomplete response files.
-
-Recent fixes pushed:
+Recent fixes:
 
 ```text
 fcb0ba9 Make NIS Z sync recover orphan slots
@@ -255,13 +210,29 @@ fcb0ba9 Make NIS Z sync recover orphan slots
 48291bc Recover stale paired NIS Z slots
 ```
 
-Those commits made the sync exit on Ctrl+C, archive stale local slots, ignore old shared backlog, wait for complete decimal responses, and made the hotkey runner less destructive.
+Those fixes made the sync exit on Ctrl+C, archive stale local slots, ignore old shared backlog, wait for complete decimal responses, and made the hotkey runner less destructive.
 
-## Working Style
+## Validation
 
-- Work step by step.
-- Prefer small changes and immediate diagnostics.
-- Preserve user changes and do not reset the repo.
-- Keep GitHub updated after meaningful fixes.
-- When pushing NIS-side changes, include exact `Invoke-WebRequest` commands for the NIS PC.
-- Treat the macro as sensitive: inspect current GitHub and local context before editing it.
+- For Python-only changes, at minimum run `python -m py_compile` on touched Python files.
+- For UI/hardware behavior, give the user a manual validation recipe with exact buttons/actions and expected state/log/output.
+- For NIS bridge changes, include NIS PC startup/update steps when relevant.
+
+## Commit Template
+
+Use this template unless the user asks for a different format:
+
+```text
+<area>: <short imperative summary>
+
+Why:
+- <user-visible problem or goal>
+
+What changed:
+- <main code/UI behavior change>
+- <important side effect or compatibility note>
+
+Validation:
+- <command or manual test performed>
+- <hardware/app test the user should perform, if not run locally>
+```
