@@ -1,7 +1,13 @@
+import json
 import math
 import os
+import queue
+import subprocess
+import sys
+import tempfile
 import threading
 import time
+import uuid
 
 from hera_app.controllers import HeraController
 
@@ -459,7 +465,7 @@ class AcquisitionMixin:
                             h,
                             update_live=True,
                             selected=True,
-                            status=f"ROI: active x={x}, y={y}, w={w}, h={h}",
+                            status=f"ROI: active w={w}, h={h}",
                         ),
                     )
                 except Exception:
@@ -549,6 +555,441 @@ class AcquisitionMixin:
             ),
         )
         self.log("Released previous sample cube before starting a new sample acquisition to reduce memory usage.")
+
+    def _helper_project_root(self):
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _helper_cache_dir(self):
+        cache_dir = os.path.join(self.default_output_dir, "helper_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _helper_request_dir(self):
+        request_dir = os.path.join(tempfile.gettempdir(), "hera_helper_requests")
+        os.makedirs(request_dir, exist_ok=True)
+        return request_dir
+
+    def _helper_blocking_sdk_cube_reason(self):
+        candidates = (
+            ("current sample", self.current_hypercube_handle, self.current_hypercube_info),
+            ("flatfield reference", self.flatfield_hypercube_handle, self.flatfield_info),
+        )
+        for label, handle, info in candidates:
+            if handle and info and not self._is_owned_cube_info(info):
+                return (
+                    f"the {label} is still held by the main Hera SDK process. "
+                    "Helper acquisition would invalidate that SDK handle."
+                )
+        return None
+
+    def _should_use_helper_acquisition(self, acquisition_role, trigger_mode_name, apply_roi, auto_save):
+        if not bool(getattr(self, "helper_acquisition_enabled", True)):
+            return False, "helper acquisition is disabled"
+        if auto_save:
+            return False, "helper acquisition is limited to manual acquisitions"
+        if trigger_mode_name != "Internal":
+            return False, "helper acquisition currently supports Internal trigger only"
+        if not apply_roi or not self.acquisition_requested_roi:
+            return False, "helper acquisition currently requires an active camera ROI"
+        blocking_reason = self._helper_blocking_sdk_cube_reason()
+        if blocking_reason:
+            return False, blocking_reason
+        return True, ""
+
+    def _build_helper_request(self, export_tag, acquisition_role, scan_mode, trigger_mode, averages, stabilization):
+        request_id = f"{acquisition_role}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        return {
+            "request_id": request_id,
+            "role": acquisition_role,
+            "dll_path": self.dll_path_var.get(),
+            "device_index": self._selected_device_index(),
+            "cache_dir": self._helper_cache_dir(),
+            "export_tag": export_tag,
+            "gain": float(self.param_vars["gain"].get()),
+            "exposure_ms": float(self.param_vars["exposure"].get()),
+            "hdr_enabled": bool(self.hdr_enabled_var.get()),
+            "roi": list(self.acquisition_requested_roi) if self.acquisition_requested_roi else None,
+            "scan_mode": int(scan_mode),
+            "trigger_mode": int(trigger_mode),
+            "averages": int(averages),
+            "stabilization_ms": int(stabilization),
+            "bands": int(self.param_vars["bands"].get()),
+            "binning": int(self.BINNING_OPTIONS[self.param_vars["binning"].get()]),
+            "data_type": int(self.DATA_TYPES[self.param_vars["data_type"].get()]),
+            "callback_timeout_sec": int(getattr(self, "helper_acquisition_timeout_sec", 900)),
+        }
+
+    def _write_helper_request(self, request):
+        request_path = os.path.join(self._helper_request_dir(), f"{request['request_id']}.json")
+        with open(request_path, "w", encoding="utf-8") as request_file:
+            json.dump(request, request_file, indent=2)
+        return request_path
+
+    def _disconnect_hera_for_helper(self):
+        if not self.controller:
+            return
+        self.log("Pausing main Hera connection while helper process owns the camera.")
+        self.live_accept_frames = False
+        try:
+            if self.controller.connected:
+                try:
+                    if self.controller.is_live_capturing():
+                        self.controller.stop_live_capture(silent=True)
+                        self.controller.wait_for_live_capture_stopped(timeout_sec=5.0)
+                except Exception as exc:
+                    self.log(f"Could not fully stop live capture before helper acquisition: {exc}")
+                self.controller.unregister_live_callbacks()
+                self.controller.unregister_callbacks()
+                self.controller.disconnect()
+        finally:
+            try:
+                self.controller.release_device()
+            except Exception:
+                pass
+            self.controller = None
+            self._clear_live_view_frame_state()
+            self._set_live_view_status("Live view: paused for helper acquisition")
+
+    def _schedule_helper_reconnect(self):
+        if getattr(self, "is_closing", False):
+            return
+        self.hdr_startup_default_enabled = bool(getattr(self, "acquisition_requested_hdr", False))
+        self._safe_after(0, self.connect_hera)
+
+    def _start_helper_acquisition(self, request):
+        self.helper_acquisition_process = None
+        self.helper_acquisition_request_id = request.get("request_id")
+        self.hera_service_acquisition_inflight = True
+        self._start_busy_progress(
+            "Acquiring flatfield in helper service..."
+            if request.get("role") == "flatfield"
+            else "Acquiring in helper service..."
+        )
+        self.log(
+            "Starting Hera helper service for "
+            f"{request.get('role')} acquisition with ROI {request.get('roi')}."
+        )
+        threading.Thread(target=self._helper_service_acquisition_worker, args=(request,), daemon=True).start()
+
+    def _helper_service_acquisition_worker(self, request):
+        result = None
+        start_time = time.perf_counter()
+        try:
+            if self.controller and self.controller.connected:
+                released = self._release_main_hera_connection(
+                    "helper service acquisition",
+                    update_state_after_release=False,
+                    clear_cached_data=False,
+                )
+                if not released:
+                    raise RuntimeError("Main Hera connection could not be released before helper service acquisition.")
+
+            client = self._get_hera_service_client()
+            client.start()
+            self._log_async("Hera helper service is ready for acquisition.")
+            result = client.request(
+                "acquire",
+                timeout_sec=float(getattr(self, "helper_process_timeout_sec", 1200)),
+                event_callback=self._handle_helper_service_acquisition_event,
+                **request,
+            )
+            try:
+                disconnected = client.request("disconnect", timeout_sec=20.0)
+                self._log_helper_service_result("Helper acquisition disconnect", disconnected)
+            except Exception as exc:
+                self._log_async(f"Helper service did not disconnect cleanly after acquisition; killing it: {exc}")
+                try:
+                    client.kill()
+                except Exception:
+                    pass
+                self.hera_service_client = None
+            if not result:
+                raise RuntimeError("Helper service finished without returning acquisition data.")
+            self._finish_helper_acquisition_result(result, request, time.perf_counter() - start_time)
+        except Exception as exc:
+            if self.last_acquisition_error == "Helper service acquisition was aborted.":
+                self._log_async("Helper service acquisition stopped after Abort.")
+                return
+            self.last_acquisition_error = str(exc)
+            self.acquisition_success = False
+            self._log_async(f"Helper service acquisition failed: {exc}")
+            self._fail_run_progress("Progress: helper acquisition failed")
+            self._safe_after(0, lambda: self.update_state("Error"))
+            self.acquisition_done_event.set()
+        finally:
+            self.hera_service_acquisition_inflight = False
+            self.helper_acquisition_request_id = None
+            self._set_acquisition_inflight(False)
+            self._schedule_helper_reconnect()
+
+    def _handle_helper_service_acquisition_event(self, event):
+        event_name = event.get("event")
+        if event_name == "log":
+            self._log_async(event.get("message", "Helper service log message"))
+        elif event_name == "progress":
+            phase = event.get("phase", "helper")
+            percent = max(0, min(100, int(event.get("percent", 0))))
+            labels = {
+                "acquiring": "Helper acquiring",
+                "computing": "Helper computing hypercube",
+                "writing_cache": "Helper writing cache",
+            }
+            self._set_run_progress(f"{labels.get(phase, 'Helper')}: {percent}%", percent, mode="determinate")
+
+    def _helper_acquisition_worker(self, request_path, request):
+        process = None
+        reader_queue = queue.Queue()
+        result = None
+        error_message = None
+        error_traceback = ""
+        start_time = time.perf_counter()
+        try:
+            command = [
+                sys.executable,
+                "-m",
+                "hera_app.helpers.acquisition_helper",
+                "--request",
+                request_path,
+            ]
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            process = subprocess.Popen(
+                command,
+                cwd=self._helper_project_root(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=creationflags,
+            )
+            self.helper_acquisition_process = process
+
+            def reader():
+                try:
+                    for line in process.stdout:
+                        reader_queue.put(line)
+                finally:
+                    reader_queue.put(None)
+
+            threading.Thread(target=reader, daemon=True).start()
+            deadline = time.monotonic() + float(getattr(self, "helper_process_timeout_sec", 1200))
+            reader_done = False
+            while True:
+                if time.monotonic() > deadline and process.poll() is None:
+                    process.kill()
+                    raise RuntimeError("Helper process timed out and was killed.")
+                try:
+                    line = reader_queue.get(timeout=0.25)
+                except queue.Empty:
+                    if process.poll() is not None and reader_done:
+                        break
+                    continue
+                if line is None:
+                    reader_done = True
+                    if process.poll() is not None:
+                        break
+                    continue
+                parsed = self._handle_helper_output_line(line)
+                if not parsed:
+                    continue
+                event = parsed.get("event")
+                if event == "result":
+                    result = parsed.get("result")
+                elif event == "error":
+                    error_message = parsed.get("message") or "Helper process failed."
+                    error_traceback = parsed.get("traceback") or ""
+
+            return_code = process.wait(timeout=2)
+            if return_code != 0:
+                raise RuntimeError(error_message or f"Helper process exited with code {return_code}.")
+            if not result:
+                raise RuntimeError("Helper process finished without returning acquisition data.")
+            self._finish_helper_acquisition_result(result, request, time.perf_counter() - start_time)
+        except Exception as exc:
+            self.last_acquisition_error = str(exc)
+            self.acquisition_success = False
+            self._log_async(f"Helper acquisition failed: {exc}")
+            if error_traceback:
+                self._log_async(error_traceback, detail=True)
+            self._fail_run_progress("Progress: helper acquisition failed")
+            self._safe_after(0, lambda: self.update_state("Error"))
+            self.acquisition_done_event.set()
+        finally:
+            self.helper_acquisition_process = None
+            self._set_acquisition_inflight(False)
+            self._schedule_helper_reconnect()
+
+    def _handle_helper_output_line(self, line):
+        text = (line or "").strip()
+        if not text:
+            return None
+        try:
+            event = json.loads(text)
+        except json.JSONDecodeError:
+            self._log_async(f"Helper output: {text}", detail=True)
+            return None
+        event_name = event.get("event")
+        if event_name == "log":
+            self._log_async(event.get("message", "Helper log message"))
+        elif event_name == "progress":
+            phase = event.get("phase", "helper")
+            percent = max(0, min(100, int(event.get("percent", 0))))
+            labels = {
+                "acquiring": "Helper acquiring",
+                "computing": "Helper computing hypercube",
+                "writing_cache": "Helper writing cache",
+            }
+            self._set_run_progress(f"{labels.get(phase, 'Helper')}: {percent}%", percent, mode="determinate")
+        return event
+
+    def _owned_data_from_helper_result(self, result, role):
+        cache_path = result.get("cache_path")
+        if not cache_path or not os.path.exists(cache_path):
+            raise RuntimeError(f"Helper cache file is missing: {cache_path}")
+        return {
+            "file_path": cache_path,
+            "wavelengths": result.get("wavelengths") or [],
+            "storage_kind": "file",
+            "width": int(result["cube_width"]),
+            "height": int(result["cube_height"]),
+            "data_type": int(result["cube_type"]),
+            "role": role,
+        }
+
+    def _finish_helper_acquisition_result(self, result, request, total_elapsed):
+        role = request.get("role", "sample")
+        requested_roi = self._normalize_roi_tuple(result.get("requested_roi") or request.get("roi"))
+        actual_roi = self._normalize_roi_tuple(result.get("actual_roi"))
+        cube_width = int(result["cube_width"])
+        cube_height = int(result["cube_height"])
+        cube_bands = int(result["cube_bands"])
+        cube_type = int(result["cube_type"])
+        raw_width = int(result["raw_width"])
+        raw_height = int(result["raw_height"])
+        display_roi, export_roi, display_width, display_height, roi_mode = self._resolve_hypercube_roi(
+            requested_roi,
+            actual_roi,
+            raw_width,
+            raw_height,
+            cube_width,
+            cube_height,
+        )
+        owned_handle = f"owned-helper:{role}:{result.get('request_id') or time.time()}"
+        owned_info = {
+            "width": display_width,
+            "height": display_height,
+            "source_width": cube_width,
+            "source_height": cube_height,
+            "display_roi": display_roi,
+            "camera_roi": actual_roi if roi_mode == "camera" else None,
+            "export_roi": export_roi,
+            "bands": cube_bands,
+            "data_type": cube_type,
+            "is_hdr": result.get("cube_is_hdr"),
+            "role": role,
+            "storage": "owned",
+            "owned_data_role": "flatfield" if role == "flatfield" else "sample",
+            "owned_storage_kind": "file",
+            "owned_file_path": result.get("cache_path"),
+        }
+        owned_data = self._owned_data_from_helper_result(result, owned_info["owned_data_role"])
+        previous_handle = self.current_hypercube_handle
+        previous_info = dict(self.current_hypercube_info) if self.current_hypercube_info else None
+        keep_previous_sample = bool(
+            role == "flatfield"
+            and previous_handle
+            and previous_info
+            and previous_info.get("role") != "flatfield"
+        )
+
+        if role == "flatfield":
+            self.flatfield_hypercube_handle = owned_handle
+            self.flatfield_info = dict(owned_info)
+            self.flatfield_hypercube_data = owned_data
+            if keep_previous_sample:
+                self.current_hypercube_handle = previous_handle
+                self.current_hypercube_info = previous_info
+        else:
+            self.current_hypercube_handle = owned_handle
+            self.current_hypercube_info = owned_info
+            self.current_hypercube_data = owned_data
+
+        self.current_hyper_band_cache = {}
+        self.current_hyper_spectrum_cache = {}
+        self.current_hyper_pointer_cache = {}
+        self.hyper_selected_pixel = None
+        self.hyper_cursor_pixel = None
+        self.hyper_selected_spectrum = None
+        self.hyper_cursor_spectrum = None
+        self.hyper_flatfield_spectrum = None
+        self.hyper_spectrum_loading = ""
+        self.hyper_spectrum_error = ""
+
+        self.pending_save_context = {
+            "hypercube_handle": owned_handle,
+            "export_tag": self.pending_export_tag or request.get("export_tag") or self._sanitize_export_tag(time.strftime("%Y%m%d_%H%M%S")),
+            "requested_roi": requested_roi,
+            "export_roi": export_roi,
+            "cube_width": cube_width,
+            "cube_height": cube_height,
+            "cube_hdr_text": "unknown" if result.get("cube_is_hdr") is None else ("on" if result.get("cube_is_hdr") else "off"),
+            "cube_is_hdr": result.get("cube_is_hdr"),
+            "info": dict(self.flatfield_info if role == "flatfield" else self.current_hypercube_info),
+            "role": role,
+        }
+        self.acquisition_success = True
+        self.last_acquisition_error = ""
+        self.acquisition_done_event.set()
+
+        timings = result.get("timings") or {}
+        self._log_async(
+            "Helper performance timing: "
+            f"callback={float(timings.get('acquisition_callback_sec', 0.0)):.2f} s, "
+            f"hypercube={float(timings.get('hypercube_compute_sec', 0.0)):.2f} s, "
+            f"cache_write={float(timings.get('cache_write_sec', 0.0)):.2f} s, "
+            f"total={total_elapsed:.2f} s.",
+            detail=True,
+        )
+        self._set_var_async(
+            self.hypercube_summary_var,
+            f"Cube: {display_width} x {display_height}, bands={cube_bands}, type={cube_type}"
+            + (f" (camera ROI)" if roi_mode == "camera" else ""),
+        )
+        if role == "flatfield":
+            self._set_var_async(self.flatfield_status_var, f"ready ({display_width} x {display_height}, bands={cube_bands})")
+            if keep_previous_sample:
+                next_mode = "Normalized" if self._should_use_flatfield_correction(self.current_hypercube_info) else "Raw"
+                self._set_var_async(self.hyper_display_mode_var, next_mode)
+                render_info = previous_info
+                render_handle = previous_handle
+            else:
+                self._set_var_async(self.hyper_display_mode_var, "Flatfield")
+                render_info = self.flatfield_info
+                render_handle = self.flatfield_hypercube_handle
+            self._log_async("Flatfield acquired by helper process and kept in memory.")
+        else:
+            render_info = self.current_hypercube_info
+            render_handle = self.current_hypercube_handle
+            self._log_async("Sample acquired by helper process and kept in memory.")
+
+        default_band = self._default_hyper_band_index_for_info(render_handle, render_info)
+
+        def finalize_helper_view(default_band=default_band, bands=render_info["bands"], role=role, render_info=render_info):
+            if role != "flatfield" and self.hyper_display_mode_var.get() == "Flatfield":
+                next_mode = "Normalized" if self._should_use_flatfield_correction(render_info) else "Raw"
+                self.hyper_display_mode_var.set(next_mode)
+            self.hyper_band_scale.config(to=max(bands - 1, 0))
+            self.current_hyper_band_index.set(default_band)
+            self.render_current_hyper_band()
+            self._refresh_export_controls_for_display_mode()
+            self.update_state("Completed")
+
+        self._safe_after(
+            0,
+            finalize_helper_view,
+        )
+        self._finish_run_progress(
+            "Progress: flatfield ready" if role == "flatfield" else "Progress: acquisition ready"
+        )
 
     def _arm_and_start_acquisition(
         self,
@@ -654,6 +1095,48 @@ class AcquisitionMixin:
             self._start_busy_progress("Preparing flatfield acquisition...")
         else:
             self._start_busy_progress("Preparing acquisition...")
+
+        scan_mode = self.SCAN_MODES[self.param_vars["scan_mode"].get()]
+        trigger_mode = self.TRIGGER_MODES[trigger_mode_name]
+        averages = int(self.param_vars["averages"].get())
+        stabilization = int(self.param_vars["stabilization"].get())
+        self.acquisition_requested_hdr = acquisition_hdr_enabled
+
+        self.acquisition_done_event.clear()
+        self.acquisition_success = False
+        self.last_export_path = ""
+        self.last_acquisition_error = ""
+        self.pending_export_tag = export_tag
+        self.pending_acquisition_role = acquisition_role
+        self.pending_acquisition_auto_save = auto_save
+        self.pending_save_context = None
+        self.last_acquisition_progress_time = None
+        self.last_acquisition_heartbeat_log_sec = 0
+        if self.save_pending_button:
+            self.save_pending_button.config(state="disabled")
+
+        use_helper, helper_reason = self._should_use_helper_acquisition(
+            acquisition_role,
+            trigger_mode_name,
+            apply_roi,
+            auto_save,
+        )
+        if use_helper:
+            helper_request = self._build_helper_request(
+                export_tag,
+                acquisition_role,
+                scan_mode,
+                trigger_mode,
+                averages,
+                stabilization,
+            )
+            self._start_helper_acquisition(helper_request)
+            arm_elapsed = time.perf_counter() - arm_start_time
+            self.log(f"Helper acquisition started. Start preparation took {arm_elapsed:.2f} s.", detail=True)
+            return
+        if helper_reason:
+            self.log(f"Helper acquisition not used: {helper_reason}", detail=True)
+
         self.log("Preparing Hera camera parameters before starting acquisition.")
         apply_start_time = time.perf_counter()
         reset_roi_before_set = False
@@ -675,25 +1158,6 @@ class AcquisitionMixin:
                 self.log(f"Camera ROI after parameter apply: {self.controller.get_roi()}")
             except Exception as exc:
                 self.log(f"Could not read camera ROI after parameter apply: {exc}")
-
-        scan_mode = self.SCAN_MODES[self.param_vars["scan_mode"].get()]
-        trigger_mode = self.TRIGGER_MODES[trigger_mode_name]
-        averages = int(self.param_vars["averages"].get())
-        stabilization = int(self.param_vars["stabilization"].get())
-        self.acquisition_requested_hdr = acquisition_hdr_enabled
-
-        self.acquisition_done_event.clear()
-        self.acquisition_success = False
-        self.last_export_path = ""
-        self.last_acquisition_error = ""
-        self.pending_export_tag = export_tag
-        self.pending_acquisition_role = acquisition_role
-        self.pending_acquisition_auto_save = auto_save
-        self.pending_save_context = None
-        self.last_acquisition_progress_time = None
-        self.last_acquisition_heartbeat_log_sec = 0
-        if self.save_pending_button:
-            self.save_pending_button.config(state="disabled")
 
         try:
             live_still_running = self.controller.is_live_capturing()
@@ -1029,6 +1493,44 @@ class AcquisitionMixin:
         threading.Thread(target=_do_save, daemon=True).start()
 
     def abort_acquisition(self):
+        if getattr(self, "hera_service_acquisition_inflight", False):
+            client = getattr(self, "hera_service_client", None)
+            try:
+                if client:
+                    client.kill()
+                    self.hera_service_client = None
+                self.log("Helper service acquisition was killed by Abort.")
+                self._fail_run_progress("Progress: helper acquisition aborted")
+                self.hera_service_acquisition_inflight = False
+                self.helper_acquisition_request_id = None
+                self._set_acquisition_inflight(False)
+                self.update_state("Ready")
+                self.acquisition_success = False
+                self.last_acquisition_error = "Helper service acquisition was aborted."
+                self.acquisition_done_event.set()
+                self._schedule_helper_reconnect()
+            except Exception as exc:
+                self.log(f"Failed to abort helper service acquisition: {exc}")
+                self._fail_run_progress("Progress: helper abort failed")
+                self.update_state("Error")
+            return
+        helper_process = getattr(self, "helper_acquisition_process", None)
+        if helper_process and helper_process.poll() is None:
+            try:
+                helper_process.kill()
+                self.log("Helper acquisition process was killed by Abort.")
+                self._fail_run_progress("Progress: helper acquisition aborted")
+                self._set_acquisition_inflight(False)
+                self.update_state("Ready")
+                self.acquisition_success = False
+                self.last_acquisition_error = "Helper acquisition was aborted."
+                self.acquisition_done_event.set()
+                self._schedule_helper_reconnect()
+            except Exception as exc:
+                self.log(f"Failed to abort helper acquisition: {exc}")
+                self._fail_run_progress("Progress: helper abort failed")
+                self.update_state("Error")
+            return
         if not self.controller or not self.controller.connected:
             self.log("Connect to Hera before aborting acquisition.")
             return

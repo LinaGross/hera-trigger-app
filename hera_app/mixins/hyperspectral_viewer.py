@@ -1,4 +1,5 @@
 import math
+import os
 import threading
 
 
@@ -337,7 +338,12 @@ class HyperspectralViewerMixin:
     def _cube_source_available(self, handle, info):
         if self._is_owned_cube_info(info):
             owned_data = self._owned_cube_data_for_info(info)
-            return bool(owned_data and (owned_data.get("array") is not None or owned_data.get("bands") is not None))
+            if not owned_data:
+                return False
+            if owned_data.get("array") is not None or owned_data.get("bands") is not None:
+                return True
+            file_path = owned_data.get("file_path")
+            return bool(file_path and os.path.exists(file_path))
         return bool(handle and self.controller)
 
     def _crop_hyper_band_array(self, band_array, roi):
@@ -371,9 +377,26 @@ class HyperspectralViewerMixin:
                     raise RuntimeError("Cached NumPy hypercube data is not available.")
                 return wavelength, cube[band_index].ravel(), width, height
             bands = owned_data.get("bands")
-            if bands is None:
-                raise RuntimeError("Cached array hypercube data is not available.")
-            return wavelength, bands[band_index], width, height
+            if bands is not None:
+                return wavelength, bands[band_index], width, height
+            file_path = owned_data.get("file_path")
+            if file_path:
+                import array
+
+                data_type = int(info.get("data_type") if info.get("data_type") is not None else owned_data.get("data_type", 0))
+                array_typecode = "f" if data_type == 0 else "d"
+                bytes_per_value = 4 if data_type == 0 else 8
+                sample_count = width * height
+                band_offset = int(band_index) * sample_count * bytes_per_value
+                values = array.array(array_typecode)
+                with open(file_path, "rb") as cache_file:
+                    cache_file.seek(band_offset)
+                    raw = cache_file.read(sample_count * bytes_per_value)
+                if len(raw) != sample_count * bytes_per_value:
+                    raise RuntimeError("Cached file-backed hypercube band is incomplete.")
+                values.frombytes(raw)
+                return wavelength, values, width, height
+            raise RuntimeError("Cached hypercube data is not available.")
 
         source_width = int(info.get("source_width", info["width"]))
         source_height = int(info.get("source_height", info["height"]))
@@ -417,11 +440,20 @@ class HyperspectralViewerMixin:
                     raise RuntimeError("Cached NumPy hypercube data is not available.")
                 return wavelength, cube[band_index]
             bands = owned_data.get("bands")
-            if bands is None:
-                raise RuntimeError("Cached array hypercube data is not available.")
             width = int(owned_data.get("width") or info.get("source_width") or info["width"])
             height = int(owned_data.get("height") or info.get("source_height") or info["height"])
-            return wavelength, np.asarray(bands[band_index]).reshape((height, width))
+            if bands is not None:
+                return wavelength, np.asarray(bands[band_index]).reshape((height, width))
+            file_path = owned_data.get("file_path")
+            if file_path:
+                dtype = "<f4" if int(info.get("data_type", owned_data.get("data_type", 0))) == 0 else "<f8"
+                band_size = width * height
+                byte_offset = int(band_index) * band_size * (4 if dtype == "<f4" else 8)
+                band = np.fromfile(file_path, dtype=dtype, count=band_size, offset=byte_offset)
+                if band.size != band_size:
+                    raise RuntimeError("Cached file-backed hypercube band is incomplete.")
+                return wavelength, band.reshape((height, width))
+            raise RuntimeError("Cached hypercube data is not available.")
 
         source_width = int(info.get("source_width", info["width"]))
         source_height = int(info.get("source_height", info["height"]))

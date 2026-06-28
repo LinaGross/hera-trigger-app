@@ -327,11 +327,18 @@ class FlatfieldMixin:
                 return
             self._prepare_flatfield_memory()
             tag = self._sanitize_export_tag(f"flatfield_{time.strftime('%Y%m%d_%H%M%S')}")
+            active_roi = self._get_active_roi()
+            helper_roi_ready = bool(
+                active_roi
+                and getattr(self, "helper_acquisition_enabled", True)
+                and self.param_vars["trigger_mode"].get() == "Internal"
+                and not self._helper_blocking_sdk_cube_reason()
+            )
             self._arm_and_start_acquisition(
                 export_tag=tag,
                 acquisition_role="flatfield",
                 auto_save=False,
-                use_camera_roi=False,
+                use_camera_roi=helper_roi_ready,
             )
         except Exception as exc:
             self.promote_next_sample_to_flatfield = False

@@ -157,7 +157,7 @@ class ROIMixin:
                 height,
                 update_live=True,
                 selected=True,
-                status=f"ROI: saved for {position.name} ({self._format_roi(roi)})",
+                status=f"ROI: saved for {position.name}, w={width}, h={height}",
             )
         else:
             self.roi_selection_active = False
@@ -338,13 +338,7 @@ class ROIMixin:
             self.live_roi_rect = roi_rect
         if selected:
             self._set_active_roi(roi_rect)
-        self.live_roi_status_var.set(
-            status
-            or (
-                f"ROI: view x={display_left}, y={display_top}, w={display_width}, h={display_height}; "
-                f"camera x={left}, y={top}, area={width * height}"
-            )
-        )
+        self.live_roi_status_var.set(status or f"ROI: w={width}, h={height}")
         if update_live:
             self.zoom_live_view_to_roi((left, top, width, height))
 
@@ -440,8 +434,7 @@ class ROIMixin:
         if not self.live_roi_rect:
             return "ROI: -"
         left, top, width, height = self.live_roi_rect
-        display_left, display_top, display_width, display_height = self._raw_roi_to_live_view_bounds(left, top, width, height)
-        return f"ROI: view x={display_left}, y={display_top}, w={display_width}, h={display_height}"
+        return f"ROI: w={width}, h={height}"
 
     def _raw_live_point_to_view_xy(self, image_x, image_y):
         frame_size = self._full_live_frame_size_for_roi()

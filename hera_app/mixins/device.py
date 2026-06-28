@@ -1,7 +1,9 @@
 import os
+import threading
 import time
 
 from hera_app.controllers import HeraController, TangoController
+from hera_app.helpers.hera_service_client import HeraServiceClient
 
 
 class DeviceMixin:
@@ -89,6 +91,232 @@ class DeviceMixin:
         except Exception as exc:
             self.log(f"Failed to connect to Hera device: {exc}")
             self.update_state("Error")
+
+    def _get_hera_service_client(self):
+        client = getattr(self, "hera_service_client", None)
+        if client and client.is_running():
+            return client
+        client = HeraServiceClient(log_func=lambda message: self._log_async(message))
+        self.hera_service_client = client
+        return client
+
+    def run_hera_helper_probe(self):
+        if getattr(self, "hera_service_probe_inflight", False):
+            self.log("Hera helper probe is already running.")
+            return
+        if self._hera_disconnect_or_acquisition_busy():
+            self.log("Helper Probe cannot start while Hera acquisition, saving, or disconnect is active.")
+            return
+        dll_path = self.dll_path_var.get()
+        device_index = self._selected_device_index()
+        self.hera_service_probe_inflight = True
+        self.log("Starting Hera helper probe...")
+        self._start_busy_progress("Helper probe: preparing")
+
+        def worker():
+            try:
+                if self.controller and self.controller.connected:
+                    if not self._release_main_hera_connection("Helper Probe", update_state_after_release=False):
+                        raise RuntimeError("Main Hera connection could not be released before Helper Probe.")
+                client = self._get_hera_service_client()
+                client.start()
+                self._log_async("Hera helper service is ready.")
+                before = client.request("status")
+                self._log_helper_service_result("Helper status before connect", before)
+                connected = client.request(
+                    "connect",
+                    dll_path=dll_path,
+                    device_index=device_index,
+                    timeout_sec=30.0,
+                )
+                self._log_helper_service_result("Helper connect", connected)
+                after = client.request("status")
+                self._log_helper_service_result("Helper status after connect", after)
+                disconnected = client.request("disconnect")
+                self._log_helper_service_result("Helper disconnect", disconnected)
+                shutdown = client.shutdown()
+                self.hera_service_client = None
+                self._log_helper_service_result("Helper shutdown", shutdown or {})
+                self._finish_run_progress("Progress: helper probe complete")
+                self._safe_after(0, lambda: self.update_state("Ready"))
+            except Exception as exc:
+                self._log_async(f"Hera helper probe failed: {exc}")
+                self._fail_run_progress("Progress: helper probe failed")
+                self._safe_after(0, lambda: self.update_state("Error"))
+            finally:
+                self.hera_service_probe_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _hera_disconnect_or_acquisition_busy(self):
+        busy_states = {
+            self.STATE_LABELS["WaitingForTrigger"],
+            self.STATE_LABELS["Acquiring"],
+            self.STATE_LABELS["ComputingHypercube"],
+            self.STATE_LABELS["Saving"],
+            self.STATE_LABELS["RunningTimelapse"],
+        }
+        start_lock = getattr(self, "acquisition_start_lock", None)
+        if getattr(self, "acquisition_inflight", False):
+            return True
+        if start_lock and start_lock.locked():
+            return True
+        if getattr(self, "app_state", "") in busy_states:
+            return True
+        return bool(getattr(self, "hera_disconnect_inflight", False))
+
+    def disconnect_hera_async(self):
+        if getattr(self, "hera_disconnect_inflight", False):
+            self.log("Hera disconnect is already running.")
+            return
+        if self._hera_disconnect_or_acquisition_busy():
+            self.log("Cannot disconnect Hera while acquisition, saving, timelapse, or another disconnect is active.")
+            return
+        if not self.controller or not self.controller.device_handle:
+            self.log("No Hera device is connected.")
+            return
+        self.hera_disconnect_inflight = True
+        self.log("Disconnecting Hera from the main app...")
+        self._start_busy_progress("Disconnecting Hera...")
+
+        def worker():
+            try:
+                released = self._release_main_hera_connection("manual disconnect")
+                if released:
+                    self._finish_run_progress("Progress: Hera disconnected")
+                else:
+                    self._fail_run_progress("Progress: Hera disconnect failed")
+            except Exception as exc:
+                self._log_async(f"Failed to disconnect Hera device: {exc}")
+                self._fail_run_progress("Progress: Hera disconnect failed")
+                self._safe_after(0, lambda: self.update_state("Error"))
+            finally:
+                self.hera_disconnect_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _release_main_hera_connection(self, purpose, update_state_after_release=True, clear_cached_data=True):
+        controller = self.controller
+        if not controller or not controller.device_handle:
+            if update_state_after_release:
+                self._safe_after(0, lambda: self.update_state("Idle"))
+            return True
+
+        disconnect_lock = getattr(self, "hera_disconnect_lock", None)
+        if disconnect_lock and not disconnect_lock.acquire(blocking=False):
+            self._log_async("Main Hera disconnect is already in progress.")
+            return False
+
+        release_ok = True
+        try:
+            self._log_async(f"Releasing main Hera connection for {purpose}...")
+            self.live_accept_frames = False
+            try:
+                if controller.connected and controller.is_live_capturing():
+                    self._log_async("Stopping main Hera live capture before release.", detail=True)
+                    controller.stop_live_capture(silent=True)
+                    controller.wait_for_live_capture_stopped(timeout_sec=5.0)
+            except Exception as exc:
+                self._log_async(f"Could not fully stop live capture before Hera release: {exc}")
+            try:
+                controller.unregister_live_callbacks()
+            except Exception as exc:
+                self._log_async(f"Could not unregister live callbacks before Hera release: {exc}", detail=True)
+            try:
+                controller.unregister_callbacks()
+            except Exception as exc:
+                self._log_async(f"Could not unregister acquisition callbacks before Hera release: {exc}", detail=True)
+            try:
+                if controller.connected:
+                    controller.disconnect()
+            except Exception as exc:
+                self._log_async(f"Could not disconnect Hera controller cleanly: {exc}")
+            try:
+                controller.release_device()
+            except Exception as exc:
+                release_ok = False
+                self._log_async(f"Could not release Hera device cleanly: {exc}")
+
+            if self.controller is controller:
+                self.controller = None
+
+            def finish_ui_cleanup():
+                self._clear_live_view_frame_state()
+                if clear_cached_data:
+                    self._clear_hypercube_viewer()
+                    self.clear_flatfield()
+                self.license_var.set("Unknown")
+                self.hdr_status_var.set(self.hdr_status_text(None))
+                self.hdr_enabled_var.set(False)
+                self.license_ok_seen = False
+                if clear_cached_data:
+                    self.last_export_var.set("Last export: -")
+                self._set_live_view_status("Live view: disconnected")
+                if update_state_after_release:
+                    self.update_state("Idle" if release_ok else "Error")
+                if release_ok:
+                    self.log("Disconnected from Hera device.")
+
+            self._safe_after(0, finish_ui_cleanup)
+            return release_ok
+        finally:
+            if disconnect_lock:
+                disconnect_lock.release()
+
+    def _log_helper_service_result(self, label, result):
+        if result is None:
+            self._log_async(f"{label}: no result")
+            return
+        device = result.get("device") or {}
+        parts = []
+        if "connected" in result:
+            parts.append(f"connected={result.get('connected')}")
+        if result.get("already_released"):
+            parts.append("already released")
+        elif "released" in result:
+            parts.append(f"released={result.get('released')}")
+        if result.get("shutdown"):
+            parts.append("shutdown=True")
+        if device:
+            parts.append(f"device={device.get('product', '-') } ({device.get('serial', '-')})")
+        if "licensed" in result:
+            parts.append(f"licensed={result.get('licensed')}")
+        if "hdr" in result:
+            parts.append(f"HDR={result.get('hdr')}")
+        if "roi" in result:
+            parts.append(f"ROI={result.get('roi')}")
+        if "acquiring" in result:
+            parts.append(f"acquiring={result.get('acquiring')}")
+        if "live_capturing" in result:
+            parts.append(f"live={result.get('live_capturing')}")
+        errors = result.get("errors")
+        if errors:
+            parts.append(f"errors={errors}")
+        self._log_async(f"{label}: " + ", ".join(parts))
+
+    def stop_hera_helper_service(self):
+        client = getattr(self, "hera_service_client", None)
+        if not client or not client.is_running():
+            self.log("Hera helper service is not running.")
+            return
+        self.log("Stopping Hera helper service...")
+
+        def worker():
+            try:
+                result = client.shutdown()
+                self.hera_service_client = None
+                self._log_helper_service_result("Helper shutdown", result or {})
+                self._finish_run_progress("Progress: helper stopped")
+            except Exception as exc:
+                self._log_async(f"Could not stop Hera helper service cleanly: {exc}")
+                try:
+                    client.kill()
+                except Exception:
+                    pass
+                self.hera_service_client = None
+                self._fail_run_progress("Progress: helper killed")
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def disconnect_hera(self):
         if not self.controller or not self.controller.device_handle:

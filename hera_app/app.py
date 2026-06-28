@@ -115,6 +115,7 @@ class HeraTriggerApp(
         self.selected_position_index = None
         self.processing_lock = threading.Lock()
         self.acquisition_start_lock = threading.Lock()
+        self.hera_disconnect_lock = threading.Lock()
         self.stage_lock = threading.Lock()
         self.live_frame_lock = threading.Lock()
         self.hypercube_read_lock = threading.Lock()
@@ -231,6 +232,15 @@ class HeraTriggerApp(
         self.acquisition_start_perf_time = None
         self.last_acquisition_progress_time = None
         self.last_acquisition_heartbeat_log_sec = 0
+        self.helper_acquisition_enabled = True
+        self.helper_acquisition_process = None
+        self.helper_acquisition_request_id = None
+        self.helper_acquisition_timeout_sec = 900
+        self.helper_process_timeout_sec = 1200
+        self.hera_service_client = None
+        self.hera_service_probe_inflight = False
+        self.hera_service_acquisition_inflight = False
+        self.hera_disconnect_inflight = False
         self.hdr_pixel_format_diagnostics_enabled = False
         self.live_max_preview_width = 480
         self.live_display_rotation_degrees = 90
@@ -689,6 +699,25 @@ class HeraTriggerApp(
         os._exit(0)
 
     def _cleanup_hardware(self):
+        try:
+            helper_process = getattr(self, "helper_acquisition_process", None)
+            if helper_process and helper_process.poll() is None:
+                helper_process.kill()
+                self._write_detail_log_line("Killed helper acquisition process during shutdown.")
+        except Exception:
+            pass
+        try:
+            helper_client = getattr(self, "hera_service_client", None)
+            if helper_client:
+                helper_client.shutdown(timeout_sec=5.0)
+                self.hera_service_client = None
+                self._write_detail_log_line("Stopped Hera helper service during shutdown.")
+        except Exception as exc:
+            try:
+                helper_client.kill()
+            except Exception:
+                pass
+            self._write_detail_log_line(f"Could not stop Hera helper service cleanly during shutdown: {exc}")
         try:
             if self.tango and self.tango.connected:
                 with self.stage_lock:

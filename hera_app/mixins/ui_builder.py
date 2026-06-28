@@ -333,9 +333,7 @@ class UIBuilderMixin:
         ).pack(side="left", fill="x", expand=True)
         btns = tk.Frame(status)
         btns.pack(fill="x", pady=(6, 0))
-        tk.Button(btns, text="Preflight", command=self.preflight_check).pack(side="left", padx=(0, 4))
-        tk.Button(btns, text="Live Status", command=self.debug_live_status).pack(side="left", padx=(0, 4))
-        tk.Button(btns, text="Restart Live", command=self.restart_live_view).pack(side="left")
+        tk.Button(btns, text="Restart Live", command=self.restart_live_view).pack(fill="x")
 
         exposure = tk.LabelFrame(camera_tab, text="Exposure", padx=6, pady=5)
         exposure.pack(fill="x", pady=(0, 6))
@@ -377,6 +375,11 @@ class UIBuilderMixin:
         tk.Button(roi_actions, textvariable=self.live_roi_button_var, command=self.toggle_live_roi_selection).pack(side="left", padx=(0, 3))
         tk.Button(roi_actions, text="Clear", command=self.clear_live_roi_selection).pack(side="left")
         tk.Label(roi, textvariable=self.live_roi_status_var, fg=self.theme["muted"], wraplength=215, justify="left").grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        advanced = tk.LabelFrame(camera_tab, text="Advanced", padx=6, pady=5)
+        advanced.pack(fill="x", pady=(0, 6))
+        tk.Button(advanced, text="Preflight", command=self.preflight_check).pack(fill="x", pady=(0, 3))
+        tk.Button(advanced, text="Disconnect Hera", command=self.disconnect_hera_async).pack(fill="x")
 
         xyz = tk.LabelFrame(stage_tab, text="XY Position", padx=6, pady=5)
         xyz.pack(fill="x", pady=(0, 6))
@@ -810,7 +813,6 @@ class UIBuilderMixin:
         buttons = tk.Frame(frame)
         buttons.grid(row=1, column=0, columnspan=3, sticky="w", pady=8)
         tk.Button(buttons, text="Preflight", command=self.preflight_check).pack(side="left", padx=6)
-        tk.Button(buttons, text="Live Status", command=self.debug_live_status).pack(side="left", padx=6)
         tk.Button(buttons, text="Restart Live", command=self.restart_live_view).pack(side="left", padx=6)
 
         params = tk.LabelFrame(frame, text="Acquisition Parameters", padx=8, pady=8)
