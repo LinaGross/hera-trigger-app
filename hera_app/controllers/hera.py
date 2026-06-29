@@ -52,6 +52,16 @@ class HeraController:
         base = os.path.abspath(os.path.dirname(__file__))
         # Also search the project root (two levels up from hera_app/controllers/)
         project_root = os.path.abspath(os.path.join(base, "..", ".."))
+        env_dll_path = os.environ.get("HERA_API_DLL")
+        if env_dll_path and os.path.exists(env_dll_path):
+            return env_dll_path
+        installed_candidates = [
+            r"C:\Program Files\Nireos\Hera SDK\HeraAPI\bin\HeraAPI.dll",
+            r"C:\Program Files (x86)\Nireos\Hera SDK\HeraAPI\bin\HeraAPI.dll",
+        ]
+        for candidate in installed_candidates:
+            if os.path.exists(candidate):
+                return candidate
         for search_dir in (base, project_root):
             candidate = os.path.join(search_dir, "HeraAPI.dll")
             if os.path.exists(candidate):
@@ -68,6 +78,9 @@ class HeraController:
     def load_dll(self):
         if not os.path.exists(self.dll_path):
             raise FileNotFoundError(f"DLL not found: {self.dll_path}")
+        dll_dir = os.path.dirname(os.path.abspath(self.dll_path))
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(dll_dir)
         self.dll = ctypes.CDLL(self.dll_path)
         self._define_functions()
 
@@ -261,6 +274,11 @@ class HeraController:
             "HeraAPI_GetDefaultOutBands",
             ctypes.c_int,
             [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)],
+        )
+        self.HeraAPI_SetSpectralSampling = self._define_optional_function(
+            "HeraAPI_SetSpectralSampling",
+            ctypes.c_int,
+            [ctypes.c_int],
         )
         self.HeraAPI_RegisterLiveCaptureCallbacks = self._define_function(
             "HeraAPI_RegisterLiveCaptureCallbacks",
@@ -648,6 +666,15 @@ class HeraController:
         bands = ctypes.c_int()
         self.check_status(self.HeraAPI_GetDefaultOutBands(self.device_handle, ctypes.c_int(scan_mode), ctypes.byref(bands)), "Get default output bands")
         return bands.value
+
+    def set_spectral_sampling(self, sampling):
+        if not self.HeraAPI_SetSpectralSampling:
+            return False
+        self.check_status(
+            self.HeraAPI_SetSpectralSampling(ctypes.c_int(int(sampling))),
+            "Set spectral sampling",
+        )
+        return True
 
     def start_hyperspectral_acquisition(self, scan_mode, trigger_mode, averages, stabilization_ms):
         self.check_status(

@@ -223,10 +223,10 @@ class UIBuilderMixin:
         self._auto_apply_traces_installed = True
         for var in (
             self.param_vars.get("scan_mode"),
+            self.param_vars.get("spectral_sampling"),
             self.param_vars.get("averages"),
             self.param_vars.get("binning"),
             self.param_vars.get("data_type"),
-            self.hdr_enabled_var,
         ):
             if var is None:
                 continue
@@ -265,6 +265,11 @@ class UIBuilderMixin:
             return
         self.apply_parameters_async()
 
+    def on_hdr_checkbox_changed(self):
+        requested = bool(self.hdr_enabled_var.get())
+        self.log(f"HDR checkbox changed: requested={self.hdr_mode_text(requested)}. Applying Hera parameters.")
+        self._schedule_auto_apply_parameters()
+
     def _param_entry(self, parent, row, label_text, key, default, width=10):
         tk.Label(parent, text=label_text).grid(row=row, column=0, sticky="w", pady=1)
         if isinstance(default, int):
@@ -281,7 +286,7 @@ class UIBuilderMixin:
     def _build_left_controls(self, parent):
         self.param_vars = {}
         self.stage_speed_var = tk.DoubleVar(value=20.0)
-        self.stage_dwell_var = tk.DoubleVar(value=0.0)
+        self.stage_dwell_var = tk.DoubleVar(value=1.0)
         self.live_pixel_size_var = tk.DoubleVar(value=1.0)
         self.live_invert_x_var = tk.BooleanVar(value=False)
         self.live_invert_y_var = tk.BooleanVar(value=False)
@@ -340,7 +345,12 @@ class UIBuilderMixin:
         exposure.grid_columnconfigure(1, weight=1)
         self._param_entry(exposure, 0, "Gain [dB]:", "gain", 0.0)
         self._param_entry(exposure, 1, "Exposure [ms]:", "exposure", 1.0)
-        tk.Checkbutton(exposure, text=self.HDR_CHECKBOX_TEXT, variable=self.hdr_enabled_var).grid(
+        tk.Checkbutton(
+            exposure,
+            text=self.HDR_CHECKBOX_TEXT,
+            variable=self.hdr_enabled_var,
+            command=self.on_hdr_checkbox_changed,
+        ).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(4, 0)
         )
 
@@ -432,9 +442,10 @@ class UIBuilderMixin:
         spectral = tk.LabelFrame(parent, text="Control Bar", padx=4, pady=3)
         spectral.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         compact_font = ("Segoe UI", 8)
-        for col in range(13):
+        for col in range(15):
             spectral.grid_columnconfigure(col, weight=1 if col % 2 else 0, minsize=0)
         self.param_vars["scan_mode"] = tk.StringVar(value="Medium")
+        self.param_vars["spectral_sampling"] = tk.StringVar(value="Uniform lambda")
         self.param_vars["trigger_mode"] = tk.StringVar(value="Internal")
         self.param_vars["averages"] = tk.IntVar(value=1)
         self.param_vars["stabilization"] = tk.IntVar(value=0)
@@ -443,6 +454,7 @@ class UIBuilderMixin:
         self.param_vars["data_type"] = tk.StringVar(value="SinglePrecision")
         controls = [
             ("Spectral", "scan_mode", "menu", self.SCAN_MODES.keys(), 6),
+            ("Sampling", "spectral_sampling", "menu", self.SPECTRAL_SAMPLING.keys(), 10),
             ("Bands", "bands", "entry", None, 4),
             ("Avg", "averages", "menu", ("1", "2", "3"), 2),
             ("Bin", "binning", "menu", self.BINNING_OPTIONS.keys(), 5),
@@ -465,6 +477,7 @@ class UIBuilderMixin:
                     padx=(0, 4),
                     pady=0,
                 )
+        set_col = len(controls) * 2
         tk.Button(
             spectral,
             text="Set",
@@ -472,9 +485,9 @@ class UIBuilderMixin:
             font=compact_font,
             padx=6,
             pady=0,
-        ).grid(row=0, column=10, sticky="ew", padx=(2, 0), pady=0)
+        ).grid(row=0, column=set_col, sticky="ew", padx=(2, 0), pady=0)
         flatfield_bar = tk.Frame(spectral)
-        flatfield_bar.grid(row=1, column=0, columnspan=12, sticky="ew", pady=(3, 0))
+        flatfield_bar.grid(row=1, column=0, columnspan=set_col + 1, sticky="ew", pady=(3, 0))
         tk.Label(flatfield_bar, text="Flatfield", font=("Segoe UI Semibold", 8)).pack(side="left", padx=(0, 4))
         tk.Label(flatfield_bar, textvariable=self.flatfield_status_var, font=compact_font, width=23, anchor="w").pack(side="left", padx=(0, 3))
         self.flatfield_acquire_button = tk.Button(
@@ -822,6 +835,7 @@ class UIBuilderMixin:
             ("Gain [dB]:", "gain", 0.0),
             ("Exposure [ms]:", "exposure", 1.0),
             ("Spectral Resolution:", "scan_mode", "Medium"),
+            ("Sampling:", "spectral_sampling", "Uniform lambda"),
             ("Averages:", "averages", 1),
             ("Bands (0=default):", "bands", 0),
             ("Binning:", "binning", "None"),
@@ -838,6 +852,9 @@ class UIBuilderMixin:
             if key == "scan_mode":
                 self.param_vars[key] = tk.StringVar(value=default)
                 tk.OptionMenu(params, self.param_vars[key], *list(self.SCAN_MODES.keys())).grid(row=row, column=1, sticky="w")
+            elif key == "spectral_sampling":
+                self.param_vars[key] = tk.StringVar(value=default)
+                tk.OptionMenu(params, self.param_vars[key], *list(self.SPECTRAL_SAMPLING.keys())).grid(row=row, column=1, sticky="w")
             elif key == "binning":
                 self.param_vars[key] = tk.StringVar(value=default)
                 tk.OptionMenu(params, self.param_vars[key], *list(self.BINNING_OPTIONS.keys())).grid(row=row, column=1, sticky="w")
@@ -871,7 +888,7 @@ class UIBuilderMixin:
         frame.pack(fill="both", expand=True)
         frame.grid_columnconfigure(0, weight=1)
         self.stage_speed_var = tk.DoubleVar(value=20.0)
-        self.stage_dwell_var = tk.DoubleVar(value=0.0)
+        self.stage_dwell_var = tk.DoubleVar(value=1.0)
         self.live_pixel_size_var = tk.DoubleVar(value=1.0)
         self.live_invert_x_var = tk.BooleanVar(value=False)
         self.live_invert_y_var = tk.BooleanVar(value=False)

@@ -247,8 +247,9 @@ class DeviceMixin:
                     self.clear_flatfield()
                 self.license_var.set("Unknown")
                 self.hdr_status_var.set(self.hdr_status_text(None))
-                self.hdr_enabled_var.set(False)
-                self.license_ok_seen = False
+                if clear_cached_data:
+                    self.hdr_enabled_var.set(False)
+                    self.license_ok_seen = False
                 if clear_cached_data:
                     self.last_export_var.set("Last export: -")
                 self._set_live_view_status("Live view: disconnected")
@@ -406,8 +407,12 @@ class DeviceMixin:
             except Exception as exc:
                 errors.append(f"Cannot create output folder: {exc}")
 
-        if self.controller and self.controller.connected and not self.check_license_status():
-            errors.append("SDK license is not active.")
+        if self.controller and self.controller.connected:
+            if self.license_ok_seen:
+                self._set_license_status_text("Licensed")
+                self.log("Preflight using cached Hera license status; live capture SDK calls are left undisturbed.", detail=True)
+            else:
+                errors.append("SDK license has not been verified in this session. Reconnect Hera first.")
 
         if errors:
             for err in errors:

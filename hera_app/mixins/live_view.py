@@ -241,9 +241,10 @@ class LiveViewMixin:
                 )
                 if live_is_hdr is not None and live_is_hdr != requested_hdr:
                     self._log_async(
-                        "Live HDR flag mismatch: "
+                        "Live HDR readback mismatch: "
                         f"checkbox requested {requested_mode_text}, "
                         f"but HeraAPI_GetLiveCaptureIsHDR reports {live_hdr_text}. "
+                        "The SDK live-capture HDR flag is used as the displayed mode. "
                         f"format={self.live_pixel_format_name}, saturation_threshold={saturation_threshold}.",
                     )
                 self._log_async(f"Live preview auto-contrast range: min={preview_min}, max={preview_max}", detail=True)
@@ -542,14 +543,10 @@ class LiveViewMixin:
     def _live_frame_mode_text(self, live_is_hdr, requested_hdr, bit_depth, bits_per_pixel, saturation_threshold):
         if live_is_hdr is True:
             return self.hdr_mode_text(True, short=True)
-        if live_is_hdr is False and not requested_hdr:
-            return self.hdr_mode_text(False, short=True)
-        if requested_hdr and self._live_threshold_uses_storage_depth(bit_depth, bits_per_pixel, saturation_threshold):
-            return f"{self.hdr_mode_text(True, short=True)} (live flag mismatch)"
         if live_is_hdr is False:
             return self.hdr_mode_text(False, short=True)
         if requested_hdr:
-            return self.hdr_mode_text(True, short=True)
+            return f"{self.hdr_mode_text(True, short=True)} (flag unknown)"
         return "unknown"
 
     def _extract_live_preview_bytes(self, raw_buffer, width, height, row_stride, bytes_per_pixel, bit_depth, bits_per_pixel, saturation_threshold, scale):

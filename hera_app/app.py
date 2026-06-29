@@ -60,6 +60,7 @@ class HeraTriggerApp(
     TRIGGER_MODES = {"Internal": 0, "DeferredStartExtLineHi": 1, "StepScanExtLoHi": 2}
     BINNING_OPTIONS = {"None": 0, "2x": 1, "4x": 2, "8x": 3, "2x Sharp": 0x1000, "4x Sharp": 0x1001}
     DATA_TYPES = {"SinglePrecision": 0, "DoublePrecision": 1}
+    SPECTRAL_SAMPLING = {"Uniform lambda": 0, "Uniform nu": 1}
     LIVE_PIXEL_FORMATS = {
         0: "Mono8",
         1: "Mono10",

@@ -187,7 +187,6 @@ class TimelapseMixin:
                     self._log_async("Reached requested stop time.")
                     break
 
-                cycle_started_at = datetime.now()
                 cycle += 1
                 self._set_var_async(self.current_cycle_var, f"Cycle: {cycle}")
                 self._log_async(f"Cycle {cycle} started.")
@@ -227,8 +226,10 @@ class TimelapseMixin:
                     self._log_async("Reached requested stop time.")
                     break
 
-                next_cycle_time = cycle_started_at + timedelta(minutes=interval_min)
-                self._log_async(f"Cycle {cycle} complete. Waiting {interval_min:.2f} minutes before next cycle.")
+                next_cycle_time = datetime.now() + timedelta(minutes=interval_min)
+                self._log_async(
+                    f"Cycle {cycle} complete. Waiting {interval_min:.2f} minutes from loop completion before next cycle."
+                )
                 while datetime.now() < next_cycle_time:
                     if self.timelapse_stop_event.is_set():
                         break
@@ -258,6 +259,9 @@ class TimelapseMixin:
         self.current_site_var.set("Site: -")
         if self.app_state != self.STATE_LABELS["Error"]:
             self.update_state("Ready" if self.controller and self.controller.connected else "Idle")
+        if not getattr(self, "is_closing", False) and not (self.controller and self.controller.connected):
+            self.log("Reconnecting Hera after helper timelapse.")
+            self._schedule_helper_reconnect()
         self.log("Timelapse stopped.")
 
     def _write_trigger_log_if_needed(self):

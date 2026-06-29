@@ -190,6 +190,9 @@ class AcquisitionMixin:
             "apply_roi": False,
             "hdr_enabled": bool(self.hdr_enabled_var.get()),
             "scan_mode_name": self.param_vars["scan_mode"].get(),
+            "spectral_sampling_name": self.param_vars.get("spectral_sampling").get()
+            if self.param_vars.get("spectral_sampling") is not None
+            else "Uniform lambda",
             "trigger_mode_name": self.param_vars["trigger_mode"].get(),
             "bands": int(self.param_vars["bands"].get()),
         }
@@ -204,6 +207,61 @@ class AcquisitionMixin:
         settings["roi_w"] = roi_w
         settings["roi_h"] = roi_h
         return roi
+
+    def _binning_spatial_divisor(self, binning_name=None):
+        name = binning_name or self.param_vars["binning"].get()
+        if name.startswith("8x"):
+            return 8
+        if name.startswith("4x"):
+            return 4
+        if name.startswith("2x"):
+            return 2
+        return 1
+
+    def _roi_adjusted_for_binning(self, roi, binning_name=None):
+        roi = self._normalize_roi_tuple(roi)
+        if not roi:
+            return None
+        divisor = self._binning_spatial_divisor(binning_name)
+        if divisor <= 1:
+            return roi
+        roi_x, roi_y, roi_w, roi_h = roi
+        adjusted_w = (roi_w // divisor) * divisor
+        adjusted_h = (roi_h // divisor) * divisor
+        if adjusted_w < divisor or adjusted_h < divisor:
+            raise RuntimeError(
+                f"ROI {self._format_roi(roi)} is too small for binning {binning_name or self.param_vars['binning'].get()}."
+            )
+        return roi_x, roi_y, adjusted_w, adjusted_h
+
+    def _apply_binning_roi_adjustment(self, roi, acquisition_role):
+        adjusted_roi = self._roi_adjusted_for_binning(roi)
+        if adjusted_roi == roi:
+            return roi
+        binning_name = self.param_vars["binning"].get()
+        self.log(
+            f"Adjusted ROI for {binning_name} binning before {acquisition_role} acquisition: "
+            f"{self._format_roi(roi)} -> {self._format_roi(adjusted_roi)}."
+        )
+        roi_x, roi_y, roi_w, roi_h = adjusted_roi
+        self.param_vars["roi_x"].set(roi_x)
+        self.param_vars["roi_y"].set(roi_y)
+        self.param_vars["roi_w"].set(roi_w)
+        self.param_vars["roi_h"].set(roi_h)
+        self._set_active_roi(adjusted_roi)
+        try:
+            self._set_roi_fields(
+                roi_x,
+                roi_y,
+                roi_w,
+                roi_h,
+                update_live=True,
+                selected=True,
+                status=f"ROI: active w={roi_w}, h={roi_h}",
+            )
+        except Exception:
+            pass
+        return adjusted_roi
 
     def _clip_roi_to_dimensions(self, roi, width, height):
         roi = self._normalize_roi_tuple(roi)
@@ -346,6 +404,8 @@ class AcquisitionMixin:
             apply_roi = settings.get("apply_roi", False)
             hdr_enabled = settings.get("hdr_enabled", False)
             scan_mode_name = settings["scan_mode_name"]
+            spectral_sampling_name = settings.get("spectral_sampling_name", "Uniform lambda")
+            spectral_sampling = self.SPECTRAL_SAMPLING.get(spectral_sampling_name, 0)
             trigger_mode_name = settings["trigger_mode_name"]
             scan_mode = self.SCAN_MODES[scan_mode_name]
             trigger_mode = self.TRIGGER_MODES[trigger_mode_name]
@@ -355,6 +415,10 @@ class AcquisitionMixin:
                 raise RuntimeError(f"Scan mode '{scan_mode_name}' is not supported by the connected device.")
             if not self.controller.is_trigger_mode_supported(trigger_mode):
                 raise RuntimeError(f"Trigger mode '{trigger_mode_name}' is not supported by the connected device.")
+            if self.controller.set_spectral_sampling(spectral_sampling):
+                self._log_async(f"Set spectral sampling: {spectral_sampling_name}")
+            else:
+                self._log_async("Spectral sampling control is not available in this Hera SDK DLL; using SDK default.")
 
             try:
                 if self.controller.is_hdr_supported():
@@ -407,12 +471,16 @@ class AcquisitionMixin:
 
             if apply_roi:
                 requested_roi = self._normalize_roi_tuple((roi_x, roi_y, roi_w, roi_h))
-                roi_writable = None
                 try:
                     roi_writable = self.controller.is_roi_writable()
-                    self._log_async(f"ROI writability before SetROI: {roi_writable}")
                 except Exception as exc:
-                    self._log_async(f"ROI writability check failed before SetROI: {exc}")
+                    raise RuntimeError(f"Could not verify ROI writability before SetROI: {exc}") from exc
+                self._log_async(f"ROI writable before SetROI: {roi_writable}")
+                if not roi_writable:
+                    raise RuntimeError(
+                        "Hera SDK reports ROI is not writable. "
+                        "ROI-limited acquisition was not started because SetROI would be rejected."
+                    )
                 if settings.get("reset_roi_before_set"):
                     try:
                         self.controller.clear_roi()
@@ -427,8 +495,7 @@ class AcquisitionMixin:
                     actual_roi = self._normalize_roi_tuple(actual_roi)
                     self.last_applied_roi = actual_roi
                     self._log_async(
-                        f"Set ROI forced: writable={roi_writable}, "
-                        f"requested=({roi_x}, {roi_y}, {roi_w}, {roi_h}), actual={actual_roi}"
+                        f"Set ROI: requested=({roi_x}, {roi_y}, {roi_w}, {roi_h}), actual={actual_roi}"
                     )
                     if actual_roi != (roi_x, roi_y, roi_w, roi_h):
                         self._log_async(
@@ -441,10 +508,9 @@ class AcquisitionMixin:
                     except Exception:
                         actual_roi = None
                     self.last_applied_roi = actual_roi
-                    self._log_async(
-                        f"Forced SetROI failed despite Marta diagnostic request: {exc}. "
-                        f"Current ROI: {actual_roi}"
-                    )
+                    raise RuntimeError(
+                        f"SetROI failed after ROI writable check passed: {exc}. Current ROI: {actual_roi}"
+                    ) from exc
                 active_roi = requested_roi
                 if actual_roi == requested_roi or (actual_roi and (actual_roi[0], actual_roi[1]) != (0, 0)):
                     active_roi = actual_roi
@@ -582,11 +648,30 @@ class AcquisitionMixin:
                 )
         return None
 
+    def _helper_file_backed_flatfield_payload(self):
+        if not self.flatfield_hypercube_handle or not self.flatfield_info:
+            return None
+        data = getattr(self, "flatfield_hypercube_data", None) or {}
+        info = self.flatfield_info or {}
+        file_path = data.get("file_path") or info.get("owned_file_path")
+        if not file_path or not os.path.exists(file_path):
+            return None
+        return {
+            "file_path": file_path,
+            "wavelengths": data.get("wavelengths") or [],
+            "source_width": int(data.get("width") or info.get("source_width") or info.get("width") or 0),
+            "source_height": int(data.get("height") or info.get("source_height") or info.get("height") or 0),
+            "bands": int(info.get("bands") or 0),
+            "data_type": int(info.get("data_type") if info.get("data_type") is not None else data.get("data_type", 0)),
+            "camera_roi": list(self._normalize_roi_tuple(info.get("camera_roi")) or []),
+            "display_roi": list(self._normalize_roi_tuple(info.get("display_roi")) or []),
+            "export_roi": list(self._normalize_roi_tuple(info.get("export_roi")) or []),
+            "is_hdr": info.get("is_hdr"),
+        }
+
     def _should_use_helper_acquisition(self, acquisition_role, trigger_mode_name, apply_roi, auto_save):
         if not bool(getattr(self, "helper_acquisition_enabled", True)):
             return False, "helper acquisition is disabled"
-        if auto_save:
-            return False, "helper acquisition is limited to manual acquisitions"
         if trigger_mode_name != "Internal":
             return False, "helper acquisition currently supports Internal trigger only"
         if not apply_roi or not self.acquisition_requested_roi:
@@ -598,6 +683,21 @@ class AcquisitionMixin:
 
     def _build_helper_request(self, export_tag, acquisition_role, scan_mode, trigger_mode, averages, stabilization):
         request_id = f"{acquisition_role}_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        auto_save = bool(getattr(self, "pending_acquisition_auto_save", False))
+        export_raw = self._bool_var_value("export_raw_var", True)
+        export_ref = self._bool_var_value("export_flatfield_var", True)
+        export_nrm = self._bool_var_value("export_normalized_var", True)
+        direct_save = bool(auto_save and acquisition_role == "sample" and self._timelapse_thread_active())
+        flatfield_payload = None
+        if direct_save and (export_ref or export_nrm):
+            flatfield_payload = self._helper_file_backed_flatfield_payload()
+            if not flatfield_payload:
+                direct_save = False
+                self.log(
+                    "Helper direct-save skipped because the loaded flatfield is not file-backed; "
+                    "falling back to helper cache plus app export.",
+                    detail=True,
+                )
         return {
             "request_id": request_id,
             "role": acquisition_role,
@@ -605,9 +705,30 @@ class AcquisitionMixin:
             "device_index": self._selected_device_index(),
             "cache_dir": self._helper_cache_dir(),
             "export_tag": export_tag,
+            "auto_save": auto_save,
+            "direct_save": direct_save,
+            "output_dir": self.param_vars["output_path"].get(),
+            "export_raw": export_raw,
+            "export_ref": export_ref,
+            "export_nrm": export_nrm,
+            "saving_notes": self.saving_notes_var.get().strip(),
+            "flatfield": flatfield_payload,
             "gain": float(self.param_vars["gain"].get()),
             "exposure_ms": float(self.param_vars["exposure"].get()),
             "hdr_enabled": bool(self.hdr_enabled_var.get()),
+            "spectral_sampling": int(
+                self.SPECTRAL_SAMPLING.get(
+                    self.param_vars.get("spectral_sampling").get()
+                    if self.param_vars.get("spectral_sampling") is not None
+                    else "Uniform lambda",
+                    0,
+                )
+            ),
+            "spectral_sampling_name": (
+                self.param_vars.get("spectral_sampling").get()
+                if self.param_vars.get("spectral_sampling") is not None
+                else "Uniform lambda"
+            ),
             "roi": list(self.acquisition_requested_roi) if self.acquisition_requested_roi else None,
             "scan_mode": int(scan_mode),
             "trigger_mode": int(trigger_mode),
@@ -655,6 +776,13 @@ class AcquisitionMixin:
             return
         self.hdr_startup_default_enabled = bool(getattr(self, "acquisition_requested_hdr", False))
         self._safe_after(0, self.connect_hera)
+
+    def _timelapse_thread_active(self):
+        thread = getattr(self, "timelapse_thread", None)
+        if not thread or not thread.is_alive():
+            return False
+        stop_event = getattr(self, "timelapse_stop_event", None)
+        return not (stop_event and stop_event.is_set())
 
     def _start_helper_acquisition(self, request):
         self.helper_acquisition_process = None
@@ -720,7 +848,10 @@ class AcquisitionMixin:
             self.hera_service_acquisition_inflight = False
             self.helper_acquisition_request_id = None
             self._set_acquisition_inflight(False)
-            self._schedule_helper_reconnect()
+            if request.get("auto_save") and self._timelapse_thread_active():
+                self._log_async("Main Hera reconnect deferred until the timelapse finishes.")
+            else:
+                self._schedule_helper_reconnect()
 
     def _handle_helper_service_acquisition_event(self, event):
         event_name = event.get("event")
@@ -733,6 +864,7 @@ class AcquisitionMixin:
                 "acquiring": "Helper acquiring",
                 "computing": "Helper computing hypercube",
                 "writing_cache": "Helper writing cache",
+                "direct_saving": "Helper direct saving",
             }
             self._set_run_progress(f"{labels.get(phase, 'Helper')}: {percent}%", percent, mode="determinate")
 
@@ -816,7 +948,10 @@ class AcquisitionMixin:
         finally:
             self.helper_acquisition_process = None
             self._set_acquisition_inflight(False)
-            self._schedule_helper_reconnect()
+            if request.get("auto_save") and self._timelapse_thread_active():
+                self._log_async("Main Hera reconnect deferred until the timelapse finishes.")
+            else:
+                self._schedule_helper_reconnect()
 
     def _handle_helper_output_line(self, line):
         text = (line or "").strip()
@@ -837,6 +972,7 @@ class AcquisitionMixin:
                 "acquiring": "Helper acquiring",
                 "computing": "Helper computing hypercube",
                 "writing_cache": "Helper writing cache",
+                "direct_saving": "Helper direct saving",
             }
             self._set_run_progress(f"{labels.get(phase, 'Helper')}: {percent}%", percent, mode="determinate")
         return event
@@ -857,6 +993,7 @@ class AcquisitionMixin:
 
     def _finish_helper_acquisition_result(self, result, request, total_elapsed):
         role = request.get("role", "sample")
+        auto_save = bool(request.get("auto_save"))
         requested_roi = self._normalize_roi_tuple(result.get("requested_roi") or request.get("roi"))
         actual_roi = self._normalize_roi_tuple(result.get("actual_roi"))
         cube_width = int(result["cube_width"])
@@ -873,6 +1010,44 @@ class AcquisitionMixin:
             cube_width,
             cube_height,
         )
+        direct_saved_paths = result.get("direct_saved_paths")
+        if direct_saved_paths is not None:
+            timings = result.get("timings") or {}
+            preferred_path = (
+                direct_saved_paths.get("nrm")
+                or direct_saved_paths.get("raw")
+                or direct_saved_paths.get("ref")
+                or ""
+            )
+            self.last_export_path = preferred_path
+            if preferred_path:
+                self._set_var_async(self.last_export_var, f"Last export: {os.path.basename(preferred_path)}")
+            self._set_var_async(
+                self.hypercube_summary_var,
+                f"Direct-saved cube: {display_width} x {display_height}, bands={cube_bands}, type={cube_type}"
+                + (f" (camera ROI)" if roi_mode == "camera" else ""),
+            )
+            measurement_dir = result.get("measurement_dir") or os.path.dirname(preferred_path)
+            saved_labels = ", ".join(sorted(direct_saved_paths)) if direct_saved_paths else "none"
+            self._log_async(
+                "Helper direct-saved measurement folder: "
+                f"{measurement_dir} ({saved_labels})"
+            )
+            self._log_async(
+                "Helper performance timing: "
+                f"callback={float(timings.get('acquisition_callback_sec', 0.0)):.2f} s, "
+                f"hypercube={float(timings.get('hypercube_compute_sec', 0.0)):.2f} s, "
+                f"direct_save={float(timings.get('direct_save_sec', 0.0)):.2f} s, "
+                f"total={total_elapsed:.2f} s.",
+                detail=True,
+            )
+            self._finish_run_progress("Progress: saved")
+            self.acquisition_success = True
+            self.last_acquisition_error = ""
+            self.acquisition_done_event.set()
+            self._safe_after(0, lambda: self.update_state("Completed"))
+            return
+
         owned_handle = f"owned-helper:{role}:{result.get('request_id') or time.time()}"
         owned_info = {
             "width": display_width,
@@ -936,9 +1111,6 @@ class AcquisitionMixin:
             "info": dict(self.flatfield_info if role == "flatfield" else self.current_hypercube_info),
             "role": role,
         }
-        self.acquisition_success = True
-        self.last_acquisition_error = ""
-        self.acquisition_done_event.set()
 
         timings = result.get("timings") or {}
         self._log_async(
@@ -971,6 +1143,41 @@ class AcquisitionMixin:
             render_handle = self.current_hypercube_handle
             self._log_async("Sample acquired by helper process and kept in memory.")
 
+        if auto_save:
+            self._safe_after(0, lambda: self.update_state("Saving"))
+            self._start_busy_progress("Saving helper acquisition data...")
+            output_dir = self.param_vars["output_path"].get()
+            os.makedirs(output_dir, exist_ok=True)
+            cube_hdr_text = self.pending_save_context["cube_hdr_text"]
+            cube_is_hdr = self.pending_save_context["cube_is_hdr"]
+            description = self._build_acquisition_description(cube_hdr_text, cube_is_hdr, role=role)
+            if role == "flatfield":
+                hdr_path, saved_paths, measurement_dir = self._export_flatfield_reference_set(
+                    owned_handle,
+                    self.pending_save_context["export_tag"],
+                    output_dir,
+                    description,
+                    self.flatfield_info,
+                )
+            else:
+                hdr_path, saved_paths, measurement_dir = self._export_measurement_set(
+                    owned_handle,
+                    self.pending_save_context["export_tag"],
+                    output_dir,
+                    description,
+                    self.current_hypercube_info,
+                )
+            self.last_export_path = hdr_path
+            self.pending_save_context = None
+            self._set_var_async(self.last_export_var, f"Last export: {os.path.basename(hdr_path)}")
+            self._log_async(
+                ("Saved flatfield folder: " if role == "flatfield" else "Saved measurement folder: ")
+                + f"{measurement_dir} ({', '.join(sorted(saved_paths))})"
+            )
+            if role == "flatfield":
+                self._set_var_async(self.flatfield_status_var, f"ready ({display_width} x {display_height}, bands={cube_bands})")
+                self._log_async("Flatfield baseline is ready and saved as _ref.")
+
         default_band = self._default_hyper_band_index_for_info(render_handle, render_info)
 
         def finalize_helper_view(default_band=default_band, bands=render_info["bands"], role=role, render_info=render_info):
@@ -988,8 +1195,13 @@ class AcquisitionMixin:
             finalize_helper_view,
         )
         self._finish_run_progress(
-            "Progress: flatfield ready" if role == "flatfield" else "Progress: acquisition ready"
+            "Progress: saved"
+            if auto_save
+            else ("Progress: flatfield ready" if role == "flatfield" else "Progress: acquisition ready")
         )
+        self.acquisition_success = True
+        self.last_acquisition_error = ""
+        self.acquisition_done_event.set()
 
     def _arm_and_start_acquisition(
         self,
@@ -1026,24 +1238,26 @@ class AcquisitionMixin:
         auto_save=True,
         use_camera_roi=True,
     ):
-        if not self.controller or not self.controller.connected:
-            raise RuntimeError("Connect to Hera before starting acquisition.")
-        if not self.check_license_status(allow_cached=True):
-            raise RuntimeError("Hera SDK license is not active.")
-        if self.controller.is_acquiring():
-            raise RuntimeError("The device is already acquiring.")
+        controller_connected = bool(self.controller and self.controller.connected)
+        if controller_connected:
+            if not self.check_license_status(allow_cached=True):
+                raise RuntimeError("Hera SDK license is not active.")
+            if self.controller.is_acquiring():
+                raise RuntimeError("The device is already acquiring.")
         if self.processing_lock.locked():
             raise RuntimeError("The previous acquisition is still being processed.")
 
         self._set_acquisition_inflight(True)
         arm_start_time = time.perf_counter()
-        live_was_running = self.controller.is_live_capturing()
+        live_was_running = self.controller.is_live_capturing() if controller_connected else False
         self.resume_live_after_acquisition = live_was_running
         self.acquisition_camera_roi = None
         if acquisition_role == "sample":
             self._release_current_sample_before_new_sample()
         if forced_roi is not None:
             forced_roi = self._normalize_roi_tuple(forced_roi)
+            if forced_roi and use_camera_roi:
+                forced_roi = self._apply_binning_roi_adjustment(forced_roi, acquisition_role)
             self.acquisition_requested_roi = forced_roi
             roi_x, roi_y, roi_w, roi_h = forced_roi
             self.param_vars["roi_x"].set(roi_x)
@@ -1068,6 +1282,11 @@ class AcquisitionMixin:
         else:
             self.acquisition_requested_roi = self._get_active_roi()
             apply_roi = bool(self.acquisition_requested_roi is not None and use_camera_roi)
+            if apply_roi:
+                self.acquisition_requested_roi = self._apply_binning_roi_adjustment(
+                    self.acquisition_requested_roi,
+                    acquisition_role,
+                )
             if self.acquisition_requested_roi:
                 if acquisition_role == "flatfield":
                     if apply_roi:
@@ -1136,6 +1355,11 @@ class AcquisitionMixin:
             return
         if helper_reason:
             self.log(f"Helper acquisition not used: {helper_reason}", detail=True)
+        if not controller_connected:
+            raise RuntimeError(
+                "Connect to Hera before starting acquisition, or use an Internal-trigger ROI acquisition "
+                "so the helper service can own the camera."
+            )
 
         self.log("Preparing Hera camera parameters before starting acquisition.")
         apply_start_time = time.perf_counter()
@@ -1305,7 +1529,10 @@ class AcquisitionMixin:
         description = f"{description}\nHyperspectral acquisition HDR flag: {cube_hdr_text}"
         description = f"{description}\nHyperspectral acquisition mode: {self.hdr_mode_text(cube_is_hdr)}"
         if self.acquisition_requested_hdr and cube_is_hdr is False:
-            description = f"{description}\nDynamic Range HDR was requested, but SDK returned Sensitivity 12-bit hyperspectral data"
+            description = (
+                f"{description}\nDynamic Range HDR was requested, but the authoritative SDK cube flag "
+                "returned Sensitivity 12-bit hyperspectral data"
+            )
         notes = self.saving_notes_var.get().strip()
         if notes:
             description = f"{description}\nUser notes: {notes}"
@@ -1715,8 +1942,9 @@ class AcquisitionMixin:
             )
             if self.acquisition_requested_hdr and data_is_hdr is False:
                 self._log_async(
-                    "Dynamic Range HDR was requested before acquisition, but the SDK returned Sensitivity 12-bit raw data. "
-                    "The device acquisition pipeline may not support HDR for this scan configuration.",
+                    "Dynamic Range HDR was requested before acquisition, but the authoritative SDK raw-data flag "
+                    "returned Sensitivity 12-bit. The device acquisition pipeline may not support HDR for this "
+                    "scan configuration.",
                     detail=True,
                 )
             if self.last_applied_roi:
@@ -1748,13 +1976,32 @@ class AcquisitionMixin:
                 last_hypercube_progress_pct["value"] = pct
                 self._set_run_progress(f"Computing hypercube: {pct}%", pct, mode="determinate")
 
-            hypercube_handle = self.controller.get_hypercube(
-                data_handle,
-                data_type,
-                bands,
-                binning,
-                progress_handler=hypercube_progress,
-            )
+            try:
+                hypercube_handle = self.controller.get_hypercube(
+                    data_handle,
+                    data_type,
+                    bands,
+                    binning,
+                    progress_handler=hypercube_progress,
+                )
+            except RuntimeError as exc:
+                if "bandsCount" in str(exc):
+                    scan_mode = self.SCAN_MODES[self.param_vars["scan_mode"].get()]
+                    sampling_name = (
+                        self.param_vars.get("spectral_sampling").get()
+                        if self.param_vars.get("spectral_sampling") is not None
+                        else "Uniform lambda"
+                    )
+                    try:
+                        default_bands = self.controller.get_default_output_bands(scan_mode)
+                    except Exception:
+                        default_bands = "unknown"
+                    raise RuntimeError(
+                        f"{exc}. Requested bands={bands}, spectral_sampling={sampling_name}, "
+                        f"SDK default/recommended bands={default_bands}. "
+                        "Use Bands=0 for the SDK default, or select Uniform lambda for custom wavelength spacing."
+                    ) from exc
+                raise
             cube_width, cube_height, cube_bands, cube_type = self.controller.get_hypercube_info(hypercube_handle)
             cube_is_hdr = None
             try:
@@ -1765,8 +2012,8 @@ class AcquisitionMixin:
             cube_hdr_text = "unknown" if cube_is_hdr is None else ("on" if cube_is_hdr else "off")
             if self.acquisition_requested_hdr and cube_is_hdr is False:
                 self._log_async(
-                    "HDR was requested, but the computed hypercube reports HDR=off. "
-                    "The exported cube is a normal dynamic-range acquisition.",
+                    "HDR was requested, but the authoritative SDK hypercube flag reports HDR=off. "
+                    "The exported cube should be treated as a Sensitivity 12-bit acquisition.",
                     detail=True,
                 )
             display_roi, export_roi, display_width, display_height, roi_mode = self._resolve_hypercube_roi(
